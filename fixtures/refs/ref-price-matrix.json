@@ -1,0 +1,15 @@
+{
+  "id": "ref-price-matrix",
+  "name": "Bag price matrix",
+  "currentVersion": 1,
+  "columns": ["route", "cabin", "pieces", "fee", "currency"],
+  "rows": [
+    { "route": "LHR-DXB", "cabin": "Y", "pieces": 2, "fee": 0,    "currency": "AED" },
+    { "route": "LHR-DXB", "cabin": "Y", "pieces": 3, "fee": 450,  "currency": "AED" },
+    { "route": "LHR-DXB", "cabin": "Y", "pieces": 4, "fee": 900,  "currency": "AED" },
+    { "route": "LHR-DXB", "cabin": "W", "pieces": 2, "fee": 0,    "currency": "AED" },
+    { "route": "LHR-DXB", "cabin": "W", "pieces": 3, "fee": 350,  "currency": "AED" },
+    { "route": "SYD-DXB", "cabin": "Y", "pieces": 2, "fee": 0,    "currency": "AED" },
+    { "route": "SYD-DXB", "cabin": "Y", "pieces": 3, "fee": 600,  "currency": "AED" }
+  ]
+}

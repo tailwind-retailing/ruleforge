@@ -1,0 +1,11 @@
+﻿<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/RuleForge.Api/RuleForge.Api.csproj" />
+    <Project Path="src/RuleForge.Cli/RuleForge.Cli.csproj" />
+    <Project Path="src/RuleForge.Core/RuleForge.Core.csproj" />
+    <Project Path="src/RuleForge.DocumentForge/RuleForge.DocumentForge.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/RuleForge.Core.Tests/RuleForge.Core.Tests.csproj" />
+  </Folder>
+</Solution>

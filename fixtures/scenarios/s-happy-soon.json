@@ -1,0 +1,8 @@
+{
+  "pnr": "ABC123",
+  "cabin": "Y",
+  "orig": "LHR",
+  "dest": "DXB",
+  "depDate": "2026-05-02T08:00:00Z",
+  "pax": [{ "id": "p1", "type": "ADT", "tier": "GOLD" }]
+}

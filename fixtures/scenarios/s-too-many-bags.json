@@ -1,0 +1,8 @@
+{
+  "pnr": "BAG999",
+  "cabin": "Y",
+  "orig": "LHR",
+  "dest": "DXB",
+  "bagPieces": 9,
+  "pax": [{ "id": "p1", "type": "ADT" }]
+}

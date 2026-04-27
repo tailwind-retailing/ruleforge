@@ -1,0 +1,28 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Local DocumentForge data + logs
+.local/
+*.dfdb
+*.dfdb.wal
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / publish output
+dist/
+publish/
+
+# NuGet
+*.nupkg
+.nuget/
+packages/

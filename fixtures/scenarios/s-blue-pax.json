@@ -1,0 +1,7 @@
+{
+  "pnr": "BLU600",
+  "cabin": "Y",
+  "orig": "LHR",
+  "dest": "DXB",
+  "pax": [{ "id": "p1", "type": "ADT", "tier": "BLUE" }]
+}

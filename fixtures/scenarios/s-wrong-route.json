@@ -1,0 +1,7 @@
+{
+  "pnr": "GHI789",
+  "cabin": "Y",
+  "orig": "SYD",
+  "dest": "DXB",
+  "pax": [{ "id": "p1", "type": "ADT" }]
+}

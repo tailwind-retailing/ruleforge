@@ -1,0 +1,8 @@
+{
+  "pnr": "PRM200",
+  "cabin": "W",
+  "orig": "LHR",
+  "dest": "DXB",
+  "depDate": "2026-05-04T08:00:00Z",
+  "pax": [{ "id": "p1", "type": "ADT" }]
+}

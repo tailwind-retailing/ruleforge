@@ -1,0 +1,129 @@
+{
+  "id": "rule-bag-policy",
+  "name": "Bag policy · Economy LHR–DXB (slice 1)",
+  "description": "Walking-skeleton rule: cabin=Y AND orig=LHR ⇒ apply bag allowance.",
+  "tags": ["ancillary", "bag", "slice-1"],
+  "category": "Ancillary",
+  "endpoint": "/v1/ancillary/bag-policy",
+  "method": "POST",
+  "status": "published",
+  "currentVersion": 1,
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pnr": { "type": "string" },
+      "cabin": { "type": "string" },
+      "orig": { "type": "string" },
+      "dest": { "type": "string" },
+      "pax": { "type": "array" }
+    },
+    "required": ["cabin", "orig"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "ruleId": { "type": "string" },
+      "ruleVersion": { "type": "integer" },
+      "decision": { "type": "string", "enum": ["apply", "skip", "error"] },
+      "evaluatedAt": { "type": "string", "format": "date-time" },
+      "result": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string" },
+          "pieces": { "type": "integer" },
+          "weightKg": { "type": "number" },
+          "fee": { "type": "number" },
+          "currency": { "type": "string" }
+        }
+      },
+      "trace": { "type": "array" }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1-input",
+      "type": "input",
+      "position": { "x": 40, "y": 200 },
+      "data": { "label": "Request", "category": "input" }
+    },
+    {
+      "id": "n2-cabin",
+      "type": "filter",
+      "position": { "x": 280, "y": 120 },
+      "data": {
+        "label": "Cabin · Economy",
+        "category": "filter",
+        "templateId": "sys-filter-str",
+        "config": {
+          "source": { "kind": "request", "path": "$.cabin" },
+          "compare": {
+            "operator": "equals",
+            "value": "Y",
+            "caseInsensitive": true,
+            "trim": true
+          },
+          "arraySelector": "first",
+          "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n3-orig",
+      "type": "filter",
+      "position": { "x": 280, "y": 280 },
+      "data": {
+        "label": "Origin · LHR",
+        "category": "filter",
+        "templateId": "sys-filter-str",
+        "config": {
+          "source": { "kind": "request", "path": "$.orig" },
+          "compare": {
+            "operator": "in",
+            "values": ["LHR"],
+            "caseInsensitive": true,
+            "trim": true
+          },
+          "arraySelector": "first",
+          "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n4-and",
+      "type": "logic",
+      "position": { "x": 540, "y": 200 },
+      "data": {
+        "label": "AND",
+        "category": "logic",
+        "templateId": "sys-and"
+      }
+    },
+    {
+      "id": "n5-output",
+      "type": "output",
+      "position": { "x": 800, "y": 200 },
+      "data": {
+        "label": "Result",
+        "category": "output",
+        "config": {
+          "result": {
+            "code": "BAG",
+            "pieces": 2,
+            "weightKg": 23,
+            "fee": 0,
+            "currency": "AED"
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "source": "n1-input", "target": "n2-cabin", "branch": "default" },
+    { "id": "e2", "source": "n1-input", "target": "n3-orig",  "branch": "default" },
+    { "id": "e3", "source": "n2-cabin", "target": "n4-and",   "branch": "pass" },
+    { "id": "e4", "source": "n3-orig",  "target": "n4-and",   "branch": "pass" },
+    { "id": "e5", "source": "n4-and",   "target": "n5-output", "branch": "pass" }
+  ],
+  "updatedAt": "2026-04-27T12:00:00.000Z",
+  "updatedBy": "slice-1-bootstrap"
+}

@@ -1,0 +1,133 @@
+{
+  "id": "rule-bag-policy",
+  "name": "Bag policy · slice 3 (date window + OR)",
+  "description": "(cabin=Y OR cabin=W) AND orig=LHR AND depDate within next 14 days ⇒ apply.",
+  "tags": ["ancillary", "bag", "slice-3"],
+  "category": "Ancillary",
+  "endpoint": "/v1/ancillary/bag-policy",
+  "method": "POST",
+  "status": "published",
+  "currentVersion": 4,
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pnr":     { "type": "string" },
+      "cabin":   { "type": "string" },
+      "orig":    { "type": "string" },
+      "dest":    { "type": "string" },
+      "depDate": { "type": "string", "format": "date-time" }
+    },
+    "required": ["cabin", "orig"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "ruleId":      { "type": "string" },
+      "ruleVersion": { "type": "integer" },
+      "decision":    { "type": "string", "enum": ["apply", "skip", "error"] },
+      "evaluatedAt": { "type": "string", "format": "date-time" },
+      "result":      { "type": "object" },
+      "trace":       { "type": "array" },
+      "durationMs":  { "type": "integer" }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1-input", "type": "input",
+      "position": { "x": 40, "y": 220 },
+      "data": { "label": "Request", "category": "input" }
+    },
+    {
+      "id": "n2-cabinY", "type": "filter",
+      "position": { "x": 280, "y": 80 },
+      "data": {
+        "label": "Cabin · Economy", "category": "filter", "templateId": "sys-filter-str",
+        "config": {
+          "source":  { "kind": "request", "path": "$.cabin" },
+          "compare": { "operator": "equals", "value": "Y", "caseInsensitive": true, "trim": true },
+          "arraySelector": "first", "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n3-cabinW", "type": "filter",
+      "position": { "x": 280, "y": 200 },
+      "data": {
+        "label": "Cabin · Premium economy", "category": "filter", "templateId": "sys-filter-str",
+        "config": {
+          "source":  { "kind": "request", "path": "$.cabin" },
+          "compare": { "operator": "equals", "value": "W", "caseInsensitive": true, "trim": true },
+          "arraySelector": "first", "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n4-cabinOR", "type": "logic",
+      "position": { "x": 540, "y": 140 },
+      "data": { "label": "OR", "category": "logic", "templateId": "sys-or" }
+    },
+    {
+      "id": "n5-orig", "type": "filter",
+      "position": { "x": 280, "y": 320 },
+      "data": {
+        "label": "Origin · LHR", "category": "filter", "templateId": "sys-filter-str",
+        "config": {
+          "source":  { "kind": "request", "path": "$.orig" },
+          "compare": { "operator": "in", "values": ["LHR"], "caseInsensitive": true, "trim": true },
+          "arraySelector": "first", "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n6-depWindow", "type": "filter",
+      "position": { "x": 280, "y": 440 },
+      "data": {
+        "label": "Departure within 14d", "category": "filter", "templateId": "sys-filter-date",
+        "config": {
+          "source":  { "kind": "request", "path": "$.depDate" },
+          "compare": {
+            "operator": "within_next",
+            "amount": 14, "unit": "days",
+            "granularity": "datetime"
+          },
+          "arraySelector": "first", "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n7-and", "type": "logic",
+      "position": { "x": 800, "y": 280 },
+      "data": { "label": "AND", "category": "logic", "templateId": "sys-and" }
+    },
+    {
+      "id": "n8-output", "type": "output",
+      "position": { "x": 1060, "y": 280 },
+      "data": {
+        "label": "Result", "category": "output",
+        "config": {
+          "result": {
+            "code": "BAG",
+            "pieces": 2,
+            "weightKg": 23,
+            "fee": 0,
+            "currency": "AED"
+          }
+        }
+      }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "source": "n1-input",   "target": "n2-cabinY",   "branch": "default" },
+    { "id": "e2", "source": "n1-input",   "target": "n3-cabinW",   "branch": "default" },
+    { "id": "e3", "source": "n1-input",   "target": "n5-orig",     "branch": "default" },
+    { "id": "e4", "source": "n1-input",   "target": "n6-depWindow","branch": "default" },
+    { "id": "e5", "source": "n2-cabinY",  "target": "n4-cabinOR",  "branch": "default" },
+    { "id": "e6", "source": "n3-cabinW",  "target": "n4-cabinOR",  "branch": "default" },
+    { "id": "e7", "source": "n4-cabinOR", "target": "n7-and",      "branch": "pass" },
+    { "id": "e8", "source": "n5-orig",    "target": "n7-and",      "branch": "pass" },
+    { "id": "e9", "source": "n6-depWindow","target": "n7-and",     "branch": "pass" },
+    { "id": "e10","source": "n7-and",     "target": "n8-output",   "branch": "pass" }
+  ],
+  "updatedAt": "2026-04-27T13:30:00.000Z",
+  "updatedBy": "slice-3-bootstrap"
+}

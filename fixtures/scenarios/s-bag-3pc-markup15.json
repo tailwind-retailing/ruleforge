@@ -1,0 +1,10 @@
+{
+  "pnr": "MKP800",
+  "cabin": "Y",
+  "orig": "LHR",
+  "dest": "DXB",
+  "route": "LHR-DXB",
+  "bagPieces": 3,
+  "markup": 0.15,
+  "pax": [{ "id": "p1", "type": "ADT" }]
+}

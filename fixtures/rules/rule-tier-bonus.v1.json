@@ -1,0 +1,65 @@
+{
+  "id": "rule-tier-bonus",
+  "name": "Tier bonus · Skywards",
+  "description": "Allowance uplift for Skywards Gold/Platinum. Sub-rule.",
+  "tags": ["ancillary", "loyalty", "sub-rule"],
+  "category": "Ancillary",
+  "endpoint": "/v1/ancillary/tier-bonus",
+  "method": "POST",
+  "status": "published",
+  "currentVersion": 1,
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pax": { "type": "array" }
+    },
+    "required": ["pax"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "bonusPieces": { "type": "integer" },
+      "bonusKg":     { "type": "number" }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1-input", "type": "input",
+      "position": { "x": 40, "y": 160 },
+      "data": { "label": "Request", "category": "input" }
+    },
+    {
+      "id": "n2-tier", "type": "filter",
+      "position": { "x": 280, "y": 160 },
+      "data": {
+        "label": "Any pax tier in Gold/Plat/iO", "category": "filter", "templateId": "sys-filter-str",
+        "config": {
+          "source":  { "kind": "request", "path": "$.pax[*].tier" },
+          "compare": { "operator": "in", "values": ["GOLD", "PLAT", "IO"], "caseInsensitive": true, "trim": true },
+          "arraySelector": "any",
+          "onMissing": "fail"
+        }
+      }
+    },
+    {
+      "id": "n3-bonus", "type": "constant",
+      "position": { "x": 540, "y": 160 },
+      "data": {
+        "label": "Bonus piece", "category": "constant",
+        "config": { "value": { "bonusPieces": 1, "bonusKg": 5 } }
+      }
+    },
+    {
+      "id": "n4-output", "type": "output",
+      "position": { "x": 800, "y": 160 },
+      "data": { "label": "Result", "category": "output" }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "source": "n1-input",  "target": "n2-tier",   "branch": "default" },
+    { "id": "e2", "source": "n2-tier",   "target": "n3-bonus",  "branch": "pass" },
+    { "id": "e3", "source": "n3-bonus",  "target": "n4-output", "branch": "default" }
+  ],
+  "updatedAt": "2026-04-27T14:00:00.000Z",
+  "updatedBy": "slice-3b-bootstrap"
+}

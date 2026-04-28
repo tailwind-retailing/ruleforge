@@ -38,6 +38,7 @@ return verb switch
     "publish" => await PublishVerb(rest),
     "mirror"  => await MirrorVerb(rest),
     "bench"   => await BenchVerb(rest),
+    "schemas" => SchemasVerb(rest),
     "-h" or "--help" => PrintTopLevelHelpAndOk(),
     _ => Unknown(verb),
 };
@@ -61,6 +62,7 @@ static void PrintTopLevelHelp()
           publish  Push a local rule snapshot to DocumentForge
           mirror   Copy collections from one DocumentForge instance to another
           bench    Benchmark the engine against a rule source
+          schemas  Export JSON Schemas for every config record (for UI builders)
 
         Use `aero <verb> --help` for verb-specific options.
         """);
@@ -686,6 +688,106 @@ static void PrintBenchHelp()
         """);
 }
 
+// ─── schemas ────────────────────────────────────────────────────────────────
+//
+// Emits one JSON Schema file per configurable record in the engine — the
+// canonical contract every UI builder (tax engine, offer engine, AERO admin)
+// can codegen TypeScript types or render forms against.
+
+static int SchemasVerb(string[] argv)
+{
+    var opts = ParseSchemasOpts(argv);
+    if (opts is null) { PrintSchemasHelp(); return 1; }
+
+    Directory.CreateDirectory(opts.OutDir);
+
+    // Mirror the engine's runtime JSON options so emitted schemas reflect the
+    // actual on-the-wire shape (camelCase, enum names from JsonStringEnumMemberName,
+    // null-omission). JsonSchemaExporter requires a TypeInfoResolver; use the
+    // default reflection-based one.
+    var jsonOpts = new JsonSerializerOptions(AeroJson.Options)
+    {
+        TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver(),
+    };
+
+    var exports = new (string FileName, Type Type, string Title)[]
+    {
+        ("rule.schema.json",                 typeof(RuleForge.Core.Models.Rule),                "Rule (top-level)"),
+        ("envelope.schema.json",             typeof(RuleForge.Core.Models.Envelope),            "Envelope (engine response)"),
+        ("string-filter-config.schema.json", typeof(RuleForge.Core.Models.StringFilterConfig),  "String filter config"),
+        ("number-filter-config.schema.json", typeof(RuleForge.Core.Models.NumberFilterConfig),  "Number filter config"),
+        ("date-filter-config.schema.json",   typeof(RuleForge.Core.Models.DateFilterConfig),    "Date filter config"),
+        ("mutator-config.schema.json",       typeof(RuleForge.Core.Models.MutatorConfig),       "Mutator config"),
+        ("calc-config.schema.json",          typeof(RuleForge.Core.Models.CalcConfig),          "Calc config"),
+        ("iterator-config.schema.json",      typeof(RuleForge.Core.Models.IteratorConfig),      "Iterator config"),
+        ("merge-config.schema.json",         typeof(RuleForge.Core.Models.MergeConfig),         "Merge config"),
+        ("reference-config.schema.json",     typeof(RuleForge.Core.Graph.ReferenceConfig),      "Reference (multi-row lookup) config"),
+        ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
+    };
+
+    Console.WriteLine($"━━ schemas → {Path.GetFullPath(opts.OutDir)} ━━");
+    foreach (var (file, type, title) in exports)
+    {
+        var schema = System.Text.Json.Schema.JsonSchemaExporter.GetJsonSchemaAsNode(jsonOpts, type);
+        // Stamp a $id and a title onto each schema so consumers can identify it.
+        if (schema is JsonObject obj)
+        {
+            obj["$id"] = $"https://ruleforge-docs.onrender.com/schemas/{file}";
+            obj["title"] = title;
+        }
+        var path = Path.Combine(opts.OutDir, file);
+        File.WriteAllText(path,
+            schema.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        Console.WriteLine($"  {title,-46}  {file}");
+    }
+    Console.WriteLine($"━━ wrote {exports.Length} schemas ━━");
+    return 0;
+}
+
+static SchemasOpts? ParseSchemasOpts(string[] argv)
+{
+    string? outDir = null;
+    for (var i = 0; i < argv.Length; i++)
+    {
+        switch (argv[i])
+        {
+            case "--out": outDir = argv[++i]; break;
+            case "-h":
+            case "--help": return null;
+            default:
+                Console.Error.WriteLine($"unknown arg: {argv[i]}");
+                return null;
+        }
+    }
+    if (outDir is null) return null;
+    return new SchemasOpts(outDir);
+}
+
+static void PrintSchemasHelp()
+{
+    Console.Error.WriteLine("""
+        schemas — export typed JSON Schemas for every engine config record
+
+          --out <dir>   Output directory (required). One file per type:
+                          rule.schema.json
+                          envelope.schema.json
+                          string-filter-config.schema.json
+                          number-filter-config.schema.json
+                          date-filter-config.schema.json
+                          mutator-config.schema.json
+                          calc-config.schema.json
+                          iterator-config.schema.json
+                          merge-config.schema.json
+                          reference-config.schema.json
+                          sub-rule-call.schema.json
+
+        Schemas are generated from the live C# types via
+        System.Text.Json.Schema.JsonSchemaExporter — they are the contract
+        the engine actually validates against. Re-run after model changes
+        and commit the output.
+        """);
+}
+
 internal sealed record RunOpts(
     string Endpoint, string RequestArg, string? HttpBaseUrl, bool Debug,
     string FixturesDir, bool UseDf, string? Env, string? DfApiKey, string? DfBaseUrl);
@@ -697,3 +799,4 @@ internal sealed record BenchOpts(
     string Endpoint, string RequestArg, int Iterations, int WarmupIterations,
     int Concurrency, bool UseDf, string? Env, string? DfApiKey, string? DfBaseUrl,
     string FixturesDir, bool Cold);
+internal sealed record SchemasOpts(string OutDir);

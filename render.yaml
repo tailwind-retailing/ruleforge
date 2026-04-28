@@ -17,7 +17,7 @@
 # After deploy:
 #   curl -H 'X-AERO-Key: <your-secret>' \
 #        -H 'content-type: application/json' \
-#        -d '{"orig":"LHR","pax":[{"id":"p1","ageCategory":"ADT"}]}' \
+#        -d '{"orig":"LHR","taxCode":"GB1","pax":[{"id":"p1","ageCategory":"ADT"}]}' \
 #        https://ruleforge.onrender.com/v1/tax/pnr
 #
 # Operational notes:
@@ -25,6 +25,10 @@
 #     new rule (or new endpoint), trigger a manual deploy in the dashboard or
 #     wait for the next push to roll the pods.
 #   - /health is open; everything else is gated by RULEFORGE_API_KEY.
+#
+# This blueprint lists EVERY environment variable the engine reads — it
+# doubles as documentation. Vars marked "(local mode only)" are inert
+# while RULEFORGE_RULE_SOURCE=df and harmless to leave at their defaults.
 
 services:
   - type: web
@@ -38,26 +42,54 @@ services:
     autoDeploy: true
 
     envVars:
-      # ── source selection ──────────────────────────────────────────────
+      # ── 1. Rule source ────────────────────────────────────────────────
+      # Where the engine reads rule snapshots from.
+      #   df    — DocumentForge over HTTP (production / staging path)
+      #   local — bundled fixture pack inside the image (smoke-test path)
       - key: RULEFORGE_RULE_SOURCE
         value: df
 
+      # ── 2. DocumentForge connection (when RULE_SOURCE=df) ─────────────
+      # Public DocumentForge by default. Point at a private DF if you stand
+      # one up as a sidecar — see deployment.html#render co-located DF.
       - key: RULEFORGE_DF_BASE_URL
         value: https://documentforge.onrender.com
 
-      # Which environment's bindings the engine reads at boot.
+      # Bearer token for the DocumentForge HTTP API. Required when source=df.
+      # SET THIS IN THE RENDER DASHBOARD before the first request.
+      - key: RULEFORGE_DF_API_KEY
+        sync: false
+
+      # Which environment doc's ruleBindings the engine enumerates at boot.
       # Bumping this to "prod" requires the matching env to exist in DF
       # with non-empty ruleBindings.
       - key: RULEFORGE_ENV
         value: staging
 
-      # ── secrets (populate in Render dashboard) ────────────────────────
-      - key: RULEFORGE_DF_API_KEY
-        sync: false           # bearer token for the DocumentForge API
+      # ── 3. Local file source (when RULE_SOURCE=local) ─────────────────
+      # Inert when source=df. Override to repoint at a different fixture
+      # set baked into the image.
+      - key: RULEFORGE_FIXTURES_DIR
+        value: /app/fixtures/rules
 
+      - key: RULEFORGE_REFS_DIR
+        value: /app/fixtures/refs
+
+      # ── 4. API auth ───────────────────────────────────────────────────
+      # Caller-side shared secret. Sent by callers as either:
+      #   X-AERO-Key: <secret>
+      #   Authorization: Bearer <secret>
+      # When unset, every request is allowed (dev mode). /health stays open
+      # regardless. SET THIS IN THE DASHBOARD — long random string.
       - key: RULEFORGE_API_KEY
-        sync: false           # caller-side X-AERO-Key shared secret
+        sync: false
 
-      # ── ASP.NET Core ──────────────────────────────────────────────────
+      # ── 5. ASP.NET Core ───────────────────────────────────────────────
       - key: ASPNETCORE_ENVIRONMENT
         value: Production
+
+      # Listening port. Set in the Dockerfile (http://+:8080) and surfaced
+      # to Render via EXPOSE 8080. Override here only if you need a non-
+      # standard port.
+      # - key: ASPNETCORE_URLS
+      #   value: http://+:8080

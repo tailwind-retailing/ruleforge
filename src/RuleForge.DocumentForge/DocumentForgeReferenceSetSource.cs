@@ -12,13 +12,30 @@ namespace RuleForge.DocumentForge;
 public sealed class DocumentForgeReferenceSetSource : IReferenceSetSource
 {
     private readonly DfClient _client;
+    private readonly string _prefix;
     private readonly ConcurrentDictionary<string, ReferenceSet> _cache = new();
     private DateTimeOffset _lastRefreshedAt = DateTimeOffset.UtcNow;
 
     public DateTimeOffset LastRefreshedAt => _lastRefreshedAt;
     public int CachedRefSetCount => _cache.Count;
+    public string CollectionPrefix => _prefix;
 
-    public DocumentForgeReferenceSetSource(DfClient client) { _client = client; }
+    /// <summary>
+    /// Construct a reference-set source backed by DocumentForge.
+    /// </summary>
+    /// <param name="client">DF HTTP client.</param>
+    /// <param name="collectionPrefix">
+    /// Optional namespacing prefix prepended to every collection name. Empty
+    /// (default) → uses <c>referencesets</c>, <c>referencesetversions</c>.
+    /// </param>
+    public DocumentForgeReferenceSetSource(DfClient client, string? collectionPrefix = null)
+    {
+        _client = client;
+        _prefix = collectionPrefix ?? string.Empty;
+    }
+
+    private string ReferenceSets => _prefix + "referencesets";
+    private string ReferenceSetVersions => _prefix + "referencesetversions";
 
     public Task RefreshAsync(CancellationToken ct = default)
     {
@@ -32,12 +49,12 @@ public sealed class DocumentForgeReferenceSetSource : IReferenceSetSource
         if (_cache.TryGetValue(referenceId, out var cached)) return cached;
 
         // Load the rule-style metadata first so we know the latest version.
-        var headerSql = $"SELECT id, name, currentVersion FROM referencesets WHERE id = '{Escape(referenceId)}'";
+        var headerSql = $"SELECT id, name, currentVersion FROM {ReferenceSets} WHERE id = '{Escape(referenceId)}'";
         var header = (await _client.QueryAsync<RefSetHeader>(headerSql, ct)).Documents.FirstOrDefault();
         if (header is null) return null;
         var version = header.CurrentVersion > 0 ? header.CurrentVersion : 1;
 
-        var dataSql = $"SELECT * FROM referencesetversions WHERE refId = '{Escape(referenceId)}' AND version = {version}";
+        var dataSql = $"SELECT * FROM {ReferenceSetVersions} WHERE refId = '{Escape(referenceId)}' AND version = {version}";
         var rv = (await _client.QueryAsync<RefSetVersion>(dataSql, ct)).Documents.FirstOrDefault();
         if (rv is null) return null;
 

@@ -23,6 +23,7 @@ public sealed class DocumentForgeRuleSource : IRuleSource
 
     private readonly DfClient _client;
     private readonly string _envName;
+    private readonly string _prefix;
     private readonly ConcurrentDictionary<(string ruleId, int version), Rule> _versionCache = new();
     private (DateTimeOffset loadedAt, IReadOnlyDictionary<string, int> bindings)? _envCache;
     private readonly SemaphoreSlim _envLock = new(1, 1);
@@ -34,11 +35,31 @@ public sealed class DocumentForgeRuleSource : IRuleSource
     /// <summary>Number of cached <c>(ruleId, version)</c> snapshots.</summary>
     public int CachedSnapshotCount => _versionCache.Count;
 
-    public DocumentForgeRuleSource(DfClient client, string envName)
+    /// <summary>Active collection-name prefix (empty string when unset).</summary>
+    public string CollectionPrefix => _prefix;
+
+    /// <summary>
+    /// Construct a rule source backed by DocumentForge.
+    /// </summary>
+    /// <param name="client">DF HTTP client.</param>
+    /// <param name="envName">Environment whose <c>ruleBindings</c> to read at boot.</param>
+    /// <param name="collectionPrefix">
+    /// Optional namespacing prefix prepended to every collection name. Empty
+    /// (default) → uses <c>rules</c>, <c>ruleversions</c>, <c>environments</c>.
+    /// Set to e.g. <c>"aerotoys.tax."</c> to read from <c>aerotoys.tax.rules</c>,
+    /// <c>aerotoys.tax.ruleversions</c>, <c>aerotoys.tax.environments</c> —
+    /// lets multiple RuleForge instances share one DocumentForge cleanly.
+    /// </param>
+    public DocumentForgeRuleSource(DfClient client, string envName, string? collectionPrefix = null)
     {
         _client = client;
         _envName = envName;
+        _prefix = collectionPrefix ?? string.Empty;
     }
+
+    private string Rules => _prefix + "rules";
+    private string RuleVersions => _prefix + "ruleversions";
+    private string Environments => _prefix + "environments";
 
     public async Task RefreshAsync(CancellationToken ct = default)
     {
@@ -74,7 +95,7 @@ public sealed class DocumentForgeRuleSource : IRuleSource
         {
             // Read the rule header to learn currentVersion.
             var header = await _client.QueryAsync<RuleHeader>(
-                $"SELECT id, endpoint, method, currentVersion FROM rules WHERE id = '{Escape(ruleId)}'", ct);
+                $"SELECT id, endpoint, method, currentVersion FROM {Rules} WHERE id = '{Escape(ruleId)}'", ct);
             var first = header.Documents.FirstOrDefault();
             if (first?.CurrentVersion is null or <= 0) return null;
             resolved = first.CurrentVersion;
@@ -99,7 +120,7 @@ public sealed class DocumentForgeRuleSource : IRuleSource
         foreach (var (ruleId, version) in bindings)
         {
             if (version <= 0) continue;
-            var sql = $"SELECT id, endpoint, method, currentVersion FROM rules WHERE id = '{Escape(ruleId)}'";
+            var sql = $"SELECT id, endpoint, method, currentVersion FROM {Rules} WHERE id = '{Escape(ruleId)}'";
             var query = await _client.QueryAsync<RuleHeader>(sql, ct);
             var header = query.Documents.FirstOrDefault();
             if (header is null) continue;
@@ -111,7 +132,8 @@ public sealed class DocumentForgeRuleSource : IRuleSource
 
     private async Task<string?> ResolveRuleIdAsync(string endpoint, HttpMethodKind method, CancellationToken ct)
     {
-        var sql = "SELECT id, endpoint, method FROM rules WHERE endpoint = '" + Escape(endpoint) +
+        var sql = "SELECT id, endpoint, method FROM " + Rules +
+                  " WHERE endpoint = '" + Escape(endpoint) +
                   "' AND method = '" + method + "'";
         var result = await _client.QueryAsync<RuleHeader>(sql, ct);
         var match = result.Documents.FirstOrDefault();
@@ -136,12 +158,12 @@ public sealed class DocumentForgeRuleSource : IRuleSource
             // by id (convention: "env-{name}") and fall back to a full scan +
             // client-side filter so we keep working even if both indexes are
             // unhealthy.
-            var byIdSql = $"SELECT * FROM environments WHERE id = 'env-{Escape(_envName)}'";
+            var byIdSql = $"SELECT * FROM {Environments} WHERE id = 'env-{Escape(_envName)}'";
             var envQuery = await _client.QueryAsync<EnvironmentDoc>(byIdSql, ct);
             var env = envQuery.Documents.FirstOrDefault();
             if (env is null)
             {
-                var allEnvs = await _client.QueryAsync<EnvironmentDoc>("SELECT * FROM environments", ct);
+                var allEnvs = await _client.QueryAsync<EnvironmentDoc>($"SELECT * FROM {Environments}", ct);
                 env = allEnvs.Documents.FirstOrDefault(e =>
                     string.Equals(e.Name, _envName, StringComparison.OrdinalIgnoreCase));
             }
@@ -157,7 +179,7 @@ public sealed class DocumentForgeRuleSource : IRuleSource
 
     private async Task<Rule?> LoadSnapshotAsync(string ruleId, int version, CancellationToken ct)
     {
-        var sql = $"SELECT * FROM ruleversions WHERE ruleId = '{Escape(ruleId)}' AND version = {version}";
+        var sql = $"SELECT * FROM {RuleVersions} WHERE ruleId = '{Escape(ruleId)}' AND version = {version}";
         var result = await _client.QueryAsync<RuleVersionDoc>(sql, ct);
         var rv = result.Documents.FirstOrDefault();
         return rv?.Snapshot;

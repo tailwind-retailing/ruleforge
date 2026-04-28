@@ -1,4 +1,4 @@
-﻿using System.Net.Http.Json;
+using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RuleForge.Core;
@@ -168,6 +168,10 @@ static async Task<int> PublishVerb(string[] argv)
     var baseUrl = opts.BaseUrl ?? "https://documentforge.onrender.com";
 
     var df = new DfClient(new HttpClient(), baseUrl, apiKey);
+    var prefix = opts.Prefix ?? Environment.GetEnvironmentVariable("RULEFORGE_COLLECTION_PREFIX") ?? "";
+    var rulesCol = prefix + "rules";
+    var rvCol = prefix + "ruleversions";
+    var envCol = prefix + "environments";
 
     Console.WriteLine($"â”â” publish to DocumentForge â”â”");
     Console.WriteLine($"  base url : {baseUrl}");
@@ -188,20 +192,20 @@ static async Task<int> PublishVerb(string[] argv)
         bundleId = (string?)null,
     };
 
-    var existingRv = await df.GetByFieldAsync<JsonElement?>("ruleversions", "id", rvId);
+    var existingRv = await df.GetByFieldAsync<JsonElement?>(rvCol, "id", rvId);
     if (TryExtractDfId(existingRv, out var prevDfId))
     {
-        await df.ReplaceAsync("ruleversions", prevDfId, rvDoc);
+        await df.ReplaceAsync(rvCol, prevDfId, rvDoc);
         Console.WriteLine($"  ruleversion {rvId} replaced (df _id {prevDfId})");
     }
     else
     {
-        var dfId = await df.InsertAsync("ruleversions", rvDoc);
+        var dfId = await df.InsertAsync(rvCol, rvDoc);
         Console.WriteLine($"  ruleversion {rvId} inserted (df _id {dfId})");
     }
 
     // 2. Bump rules.currentVersion (best-effort â€” replace the matching doc).
-    var ruleHeader = await df.GetByFieldAsync<JsonElement?>("rules", "id", snapshot.Id);
+    var ruleHeader = await df.GetByFieldAsync<JsonElement?>(rulesCol, "id", snapshot.Id);
     if (TryExtractDfId(ruleHeader, out var ruleDfId))
     {
         var bumped = JsonSerializer.Deserialize<Dictionary<string, object?>>(ruleHeader!.Value.GetRawText())!;
@@ -209,7 +213,7 @@ static async Task<int> PublishVerb(string[] argv)
         bumped["status"] = "published";
         bumped["updatedAt"] = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
         bumped.Remove("_id");
-        await df.ReplaceAsync("rules", ruleDfId, bumped);
+        await df.ReplaceAsync(rulesCol, ruleDfId, bumped);
         Console.WriteLine($"  rules[{snapshot.Id}].currentVersion â†’ {snapshot.CurrentVersion}");
     }
     else
@@ -220,7 +224,7 @@ static async Task<int> PublishVerb(string[] argv)
     // 3. Bind the env. We bypass the by/name lookup because the live DF
     //    instance has a stale unique index; SQL by id (convention env-{name})
     //    with a full-scan fallback is more reliable.
-    var env = await FindEnvironmentAsync(df, opts.EnvName);
+    var env = await FindEnvironmentAsync(df, opts.EnvName, prefix);
     if (TryExtractDfId(env, out var envDfId))
     {
         var envDoc = JsonSerializer.Deserialize<Dictionary<string, object?>>(env!.Value.GetRawText())!;
@@ -230,7 +234,7 @@ static async Task<int> PublishVerb(string[] argv)
         bindings[snapshot.Id] = snapshot.CurrentVersion;
         envDoc["ruleBindings"] = bindings;
         envDoc.Remove("_id");
-        await df.ReplaceAsync("environments", envDfId, envDoc);
+        await df.ReplaceAsync(envCol, envDfId, envDoc);
         Console.WriteLine($"  environments[{opts.EnvName}].ruleBindings[{snapshot.Id}] = {snapshot.CurrentVersion}");
     }
     else
@@ -252,7 +256,8 @@ static (IRuleSource, IReferenceSetSource) BuildDfSources(RunOpts opts)
     var baseUrl = opts.DfBaseUrl ?? "https://documentforge.onrender.com";
     var env = opts.Env ?? "staging";
     var df = new DfClient(new HttpClient(), baseUrl, apiKey);
-    return (new DocumentForgeRuleSource(df, env), new DocumentForgeReferenceSetSource(df));
+    var prefix = opts.Prefix ?? Environment.GetEnvironmentVariable("RULEFORGE_COLLECTION_PREFIX") ?? "";
+    return (new DocumentForgeRuleSource(df, env, prefix), new DocumentForgeReferenceSetSource(df, prefix));
 }
 
 static (IRuleSource, IReferenceSetSource) BuildLocalSources(RunOpts opts)
@@ -264,13 +269,14 @@ static (IRuleSource, IReferenceSetSource) BuildLocalSources(RunOpts opts)
 
 static string ReadInline(string arg) => arg.StartsWith("@") ? File.ReadAllText(arg[1..]) : arg;
 
-static async Task<JsonElement?> FindEnvironmentAsync(DfClient df, string envName)
+static async Task<JsonElement?> FindEnvironmentAsync(DfClient df, string envName, string prefix = "")
 {
+    var coll = prefix + "environments";
     var byId = await df.QueryAsync<JsonElement>(
-        $"SELECT * FROM environments WHERE id = 'env-{envName.Replace("'", "''")}'");
+        $"SELECT * FROM {coll} WHERE id = 'env-{envName.Replace("'", "''")}'");
     if (byId.Documents.Count > 0) return byId.Documents[0];
 
-    var all = await df.QueryAsync<JsonElement>("SELECT * FROM environments");
+    var all = await df.QueryAsync<JsonElement>($"SELECT * FROM {coll}");
     foreach (var doc in all.Documents)
     {
         if (doc.ValueKind != JsonValueKind.Object) continue;
@@ -294,7 +300,7 @@ static bool TryExtractDfId(JsonElement? maybe, out string id)
 
 static RunOpts? ParseRunOpts(string[] argv)
 {
-    string? endpoint = null, request = null, http = null, env = null, dfKey = null, dfBase = null;
+    string? endpoint = null, request = null, http = null, env = null, dfKey = null, dfBase = null, prefix = null;
     var debug = false; var useDf = false;
     var fixtures = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "fixtures", "rules");
 
@@ -311,6 +317,7 @@ static RunOpts? ParseRunOpts(string[] argv)
             case "--env":        env      = argv[++i]; break;
             case "--df-api-key": dfKey    = argv[++i]; break;
             case "--df-base":    dfBase   = argv[++i]; break;
+            case "--prefix":     prefix   = argv[++i]; break;
             case "-h":
             case "--help":       return null;
             default:
@@ -319,12 +326,12 @@ static RunOpts? ParseRunOpts(string[] argv)
         }
     }
     if (endpoint is null || request is null) return null;
-    return new RunOpts(endpoint, request, http, debug, fixtures, useDf, env, dfKey, dfBase);
+    return new RunOpts(endpoint, request, http, debug, fixtures, useDf, env, dfKey, dfBase, prefix);
 }
 
 static PublishOpts? ParsePublishOpts(string[] argv)
 {
-    string? rule = null, env = null, key = null, baseUrl = null;
+    string? rule = null, env = null, key = null, baseUrl = null, prefix = null;
     for (var i = 0; i < argv.Length; i++)
     {
         switch (argv[i])
@@ -333,6 +340,7 @@ static PublishOpts? ParsePublishOpts(string[] argv)
             case "--env":      env  = argv[++i]; break;
             case "--api-key":  key  = argv[++i]; break;
             case "--df-base":  baseUrl = argv[++i]; break;
+            case "--prefix":   prefix = argv[++i]; break;
             case "-h":
             case "--help":     return null;
             default:
@@ -341,7 +349,7 @@ static PublishOpts? ParsePublishOpts(string[] argv)
         }
     }
     if (rule is null) return null;
-    return new PublishOpts(rule, env ?? "staging", key, baseUrl);
+    return new PublishOpts(rule, env ?? "staging", key, baseUrl, prefix);
 }
 
 static void PrintRunHelp()
@@ -638,12 +646,13 @@ static (IRuleSource, IReferenceSetSource) BuildDfSourcesForBench(BenchOpts opts)
     var baseUrl = opts.DfBaseUrl ?? "https://documentforge.onrender.com";
     var env = opts.Env ?? "staging";
     var df = new DfClient(new HttpClient(), baseUrl, apiKey);
-    return (new DocumentForgeRuleSource(df, env), new DocumentForgeReferenceSetSource(df));
+    var prefix = opts.Prefix ?? Environment.GetEnvironmentVariable("RULEFORGE_COLLECTION_PREFIX") ?? "";
+    return (new DocumentForgeRuleSource(df, env, prefix), new DocumentForgeReferenceSetSource(df, prefix));
 }
 
 static BenchOpts? ParseBenchOpts(string[] argv)
 {
-    string? endpoint = null, request = null, env = null, dfKey = null, dfBase = null;
+    string? endpoint = null, request = null, env = null, dfKey = null, dfBase = null, prefix = null;
     var iters = 1000; var warmup = 100; var conc = 1; var useDf = false; var cold = false;
     var fixtures = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "..", "fixtures", "rules");
     for (var i = 0; i < argv.Length; i++)
@@ -661,6 +670,7 @@ static BenchOpts? ParseBenchOpts(string[] argv)
             case "--df-base":      dfBase   = argv[++i]; break;
             case "--fixtures":     fixtures = argv[++i]; break;
             case "--cold":         cold     = true; break;
+            case "--prefix":       prefix   = argv[++i]; break;
             case "-h":
             case "--help":         return null;
             default:
@@ -669,7 +679,7 @@ static BenchOpts? ParseBenchOpts(string[] argv)
         }
     }
     if (endpoint is null || request is null) return null;
-    return new BenchOpts(endpoint, request, iters, warmup, conc, useDf, env, dfKey, dfBase, fixtures, cold);
+    return new BenchOpts(endpoint, request, iters, warmup, conc, useDf, env, dfKey, dfBase, fixtures, cold, prefix);
 }
 
 static void PrintBenchHelp()
@@ -790,13 +800,15 @@ static void PrintSchemasHelp()
 
 internal sealed record RunOpts(
     string Endpoint, string RequestArg, string? HttpBaseUrl, bool Debug,
-    string FixturesDir, bool UseDf, string? Env, string? DfApiKey, string? DfBaseUrl);
-internal sealed record PublishOpts(string RuleFile, string EnvName, string? ApiKey, string? BaseUrl);
+    string FixturesDir, bool UseDf, string? Env, string? DfApiKey, string? DfBaseUrl,
+    string? Prefix = null);
+internal sealed record PublishOpts(string RuleFile, string EnvName, string? ApiKey, string? BaseUrl,
+    string? Prefix = null);
 internal sealed record MirrorOpts(
     string FromUrl, string? FromKey, string ToUrl, string? ToKey,
     IReadOnlyList<string> Collections);
 internal sealed record BenchOpts(
     string Endpoint, string RequestArg, int Iterations, int WarmupIterations,
     int Concurrency, bool UseDf, string? Env, string? DfApiKey, string? DfBaseUrl,
-    string FixturesDir, bool Cold);
+    string FixturesDir, bool Cold, string? Prefix = null);
 internal sealed record SchemasOpts(string OutDir);

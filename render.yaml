@@ -66,6 +66,14 @@ services:
       - key: RULEFORGE_ENV
         value: staging
 
+      # Optional collection-name prefix. Lets multiple RuleForge engines
+      # share one DocumentForge cleanly.
+      #   ""               → uses rules / ruleversions / environments / …
+      #   "aerotoys.tax."  → uses aerotoys.tax.rules / .ruleversions / …
+      #   "aerotoys.offer."→ a different engine on the same DF, no collision
+      - key: RULEFORGE_COLLECTION_PREFIX
+        value: ""
+
       # ── 3. Local file source (when RULE_SOURCE=local) ─────────────────
       # Inert when source=df. Override to repoint at a different fixture
       # set baked into the image.

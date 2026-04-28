@@ -23,9 +23,17 @@ if (ruleSourceKind == "df")
     var envName = builder.Configuration["RULEFORGE_ENV"]
                   ?? Environment.GetEnvironmentVariable("RULEFORGE_ENV")
                   ?? "staging";
+    // Optional collection-name namespacing — lets multiple RuleForge instances
+    // share one DocumentForge cleanly. Empty (default) keeps the current
+    // behavior. Common pattern: "aerotoys.tax." or "aerotoys.offer.".
+    var prefix = builder.Configuration["RULEFORGE_COLLECTION_PREFIX"]
+                 ?? Environment.GetEnvironmentVariable("RULEFORGE_COLLECTION_PREFIX")
+                 ?? "";
     builder.Services.AddSingleton(_ => new DfClient(new HttpClient(), baseUrl, apiKey));
-    builder.Services.AddSingleton<IRuleSource>(sp => new DocumentForgeRuleSource(sp.GetRequiredService<DfClient>(), envName));
-    builder.Services.AddSingleton<IReferenceSetSource>(sp => new DocumentForgeReferenceSetSource(sp.GetRequiredService<DfClient>()));
+    builder.Services.AddSingleton<IRuleSource>(sp =>
+        new DocumentForgeRuleSource(sp.GetRequiredService<DfClient>(), envName, prefix));
+    builder.Services.AddSingleton<IReferenceSetSource>(sp =>
+        new DocumentForgeReferenceSetSource(sp.GetRequiredService<DfClient>(), prefix));
 }
 else
 {

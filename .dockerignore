@@ -1,0 +1,30 @@
+# Source-only from this point; the SDK image handles tooling.
+**/bin/
+**/obj/
+**/*.user
+**/.vs/
+**/.vscode/
+**/.idea/
+
+# Local-only artefacts
+.local/
+*.dfdb
+*.dfdb.wal
+.claude/
+
+# Tests aren't shipped in the image
+tests/
+
+# Docs / fixtures-scenarios are build noise (only fixtures/rules + fixtures/refs ship)
+docs/
+fixtures/scenarios/
+
+# Git + GitHub metadata
+.git/
+.github/
+.gitignore
+.gitattributes
+
+# OS junk
+.DS_Store
+Thumbs.db

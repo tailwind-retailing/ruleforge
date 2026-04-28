@@ -95,6 +95,7 @@ You should see an envelope like:
 | `publish` | Push a local rule snapshot into DocumentForge as a new ruleversion |
 | `mirror`  | Idempotent copy of any DocumentForge instance into another (handy for spinning up a co-located dfdb) |
 | `bench`   | Sequential or concurrent throughput / latency probe |
+| `schemas` | Emit JSON Schemas for every config record (for UI builders) |
 
 Each verb supports `--help` for the full option list. Full reference:
 [`cli-reference.html`](https://ruleforge-docs.onrender.com/cli-reference.html).
@@ -109,13 +110,73 @@ src/
   RuleForge.Cli             run · publish · mirror · bench
 
 tests/
-  RuleForge.Core.Tests      126 unit + integration tests
+  RuleForge.Core.Tests      138 unit + integration tests
 
 fixtures/
-  rules/                    Versioned rule snapshots (v1..v7) + endpoint bindings
-  refs/                     Reference sets (price matrix, etc.)
+  rules/                    Versioned rule snapshots + endpoint bindings
+  refs/                     Reference sets (price matrix, tax rates, etc.)
   scenarios/                Sample request payloads
+
+Dockerfile                  Multi-stage build → 210 MB framework-dependent image
+render.yaml                 Render Blueprint — single web service co-located with DF
 ```
+
+## Deploying to Render
+
+The repo ships with a [Render Blueprint](https://render.com/docs/blueprint-spec) at
+`render.yaml`. One-click deploy gives you a Docker web service co-located with
+DocumentForge (oregon region) so cold-path lookups stay loopback-fast.
+
+**Steps**
+
+1. In the Render dashboard: **New +** → **Blueprint** → select
+   `tailwind-retailing/ruleforge`. Render reads `render.yaml` and creates the
+   service.
+2. Set the two `sync: false` secrets in the Render dashboard:
+   - `RULEFORGE_DF_API_KEY` — bearer token for the DocumentForge HTTP API
+   - `RULEFORGE_API_KEY` — caller-side `X-AERO-Key` shared secret (set this to
+     a long random string)
+3. Render builds the Docker image, deploys, and gives you a `*.onrender.com`
+   URL. `/health` is open; `/admin/bindings` lists what the auto-router
+   bound at boot; everything else is gated by `RULEFORGE_API_KEY`.
+
+**Default settings** (override in `render.yaml` or the dashboard)
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `RULEFORGE_RULE_SOURCE` | `df` | Read rules from DocumentForge |
+| `RULEFORGE_DF_BASE_URL` | `https://documentforge.onrender.com` | The public DocumentForge instance |
+| `RULEFORGE_ENV` | `staging` | Which `environments[*].ruleBindings` to enumerate at boot |
+| `RULEFORGE_DF_API_KEY` | *(secret)* | DF bearer token |
+| `RULEFORGE_API_KEY` | *(secret)* | Caller auth |
+| `ASPNETCORE_ENVIRONMENT` | `Production` | Standard ASP.NET Core flag |
+
+**First request once deployed**
+
+```bash
+curl -X POST https://ruleforge.onrender.com/v1/tax/pnr \
+  -H 'X-AERO-Key: <your-secret>' \
+  -H 'content-type: application/json' \
+  -d '{
+        "orig": "LHR",
+        "taxCode": "GB1",
+        "pax": [
+          { "id": "p1", "ageCategory": "ADT" },
+          { "id": "p2", "ageCategory": "CHD" }
+        ]
+      }'
+```
+
+This hits the per-pax tax fixture (`rule-pnr-taxes@1`) shipped in the image.
+Substitute your own published rules once the AERO admin team has authored
+them and bound them to your environment.
+
+**Operational note**
+
+The auto-router enumerates environment bindings **once at boot**. After
+publishing a new rule binding, trigger a redeploy in Render (or push to
+main — autoDeploy is on) so the new endpoint registers. We'll add a
+`/admin/reload-bindings` endpoint in a future slice to avoid the restart.
 
 ## Status
 

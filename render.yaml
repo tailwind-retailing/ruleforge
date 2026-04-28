@@ -1,0 +1,63 @@
+# Render blueprint for RuleForge — the runtime rules engine.
+#
+# This config provisions a single Docker-runtime web service co-located with
+# DocumentForge (oregon region) so cold-path lookups stay loopback-fast. The
+# engine reads rule snapshots from the public DocumentForge instance by
+# default; flip RULEFORGE_DF_BASE_URL to a private DF if you stand one up
+# alongside.
+#
+# To deploy:
+#   1. Push this repo to GitHub (already done).
+#   2. In Render: New + → Blueprint → select tailwind-retailing/ruleforge.
+#   3. Render reads this file and creates a Docker web service.
+#   4. Before the first request: in the dashboard, populate the two
+#      sync: false secrets (RULEFORGE_DF_API_KEY, RULEFORGE_API_KEY).
+#   5. Push to main → Render redeploys automatically.
+#
+# After deploy:
+#   curl -H 'X-AERO-Key: <your-secret>' \
+#        -H 'content-type: application/json' \
+#        -d '{"orig":"LHR","pax":[{"id":"p1","ageCategory":"ADT"}]}' \
+#        https://ruleforge.onrender.com/v1/tax/pnr
+#
+# Operational notes:
+#   - Auto-router enumerates env bindings ONCE at boot. After publishing a
+#     new rule (or new endpoint), trigger a manual deploy in the dashboard or
+#     wait for the next push to roll the pods.
+#   - /health is open; everything else is gated by RULEFORGE_API_KEY.
+
+services:
+  - type: web
+    name: ruleforge
+    runtime: docker
+    plan: starter            # 512 MB RAM. Plenty for warm steady-state at ~70µs/req.
+    region: oregon           # match DocumentForge to keep cold-paths in-region.
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+
+    envVars:
+      # ── source selection ──────────────────────────────────────────────
+      - key: RULEFORGE_RULE_SOURCE
+        value: df
+
+      - key: RULEFORGE_DF_BASE_URL
+        value: https://documentforge.onrender.com
+
+      # Which environment's bindings the engine reads at boot.
+      # Bumping this to "prod" requires the matching env to exist in DF
+      # with non-empty ruleBindings.
+      - key: RULEFORGE_ENV
+        value: staging
+
+      # ── secrets (populate in Render dashboard) ────────────────────────
+      - key: RULEFORGE_DF_API_KEY
+        sync: false           # bearer token for the DocumentForge API
+
+      - key: RULEFORGE_API_KEY
+        sync: false           # caller-side X-AERO-Key shared secret
+
+      # ── ASP.NET Core ──────────────────────────────────────────────────
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production

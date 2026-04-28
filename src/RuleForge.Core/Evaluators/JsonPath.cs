@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using RuleForge.Core.Models;
 
 namespace RuleForge.Core.Evaluators;
 
@@ -18,8 +19,29 @@ namespace RuleForge.Core.Evaluators;
 /// </summary>
 public static class JsonPath
 {
-    public static IReadOnlyList<JsonElement?> Resolve(JsonElement? root, string path)
+    public static IReadOnlyList<JsonElement?> Resolve(JsonElement? root, string path) =>
+        Resolve(root, path, frames: null);
+
+    /// <summary>
+    /// Resolve <paramref name="path"/> against <paramref name="root"/>, with
+    /// optional <paramref name="frames"/> from the runner's iteration stack.
+    /// When a path begins with <c>$&lt;name&gt;</c> matching a frame's name
+    /// (or <c>$&lt;name&gt;Index</c> / <c>$&lt;name&gt;Count</c>), the resolver
+    /// switches root to that frame and traverses the rest of the path against it.
+    /// </summary>
+    public static IReadOnlyList<JsonElement?> Resolve(
+        JsonElement? root,
+        string path,
+        IReadOnlyList<IterationFrame>? frames)
     {
+        // First — see if the path's leading variable matches an iteration frame.
+        // Frames are scanned innermost-first so closer scopes shadow outer ones.
+        if (frames is { Count: > 0 } && TrySwitchRootToFrame(path, frames, out var newRoot, out var rest))
+        {
+            root = newRoot;
+            path = rest;
+        }
+
         var cleaned = StripPrefix(path);
         if (cleaned.Length == 0)
             return root is null ? Array.Empty<JsonElement?>() : new[] { root };
@@ -71,6 +93,60 @@ public static class JsonPath
         // a JsonElement with ValueKind.Null so downstream null-aware operators
         // (is_null, is_empty) can see it.
         return frontier.Where(e => e is not null).ToList()!;
+    }
+
+    /// <summary>
+    /// If <paramref name="path"/> opens with <c>$&lt;frame-name&gt;</c> (optionally
+    /// followed by <c>Index</c> or <c>Count</c>), switch root to that frame's
+    /// item / index / count value and return the remaining path. Returns false
+    /// if no frame matched — the caller falls back to root resolution.
+    /// </summary>
+    private static bool TrySwitchRootToFrame(
+        string path,
+        IReadOnlyList<IterationFrame> frames,
+        out JsonElement? newRoot,
+        out string rest)
+    {
+        newRoot = null;
+        rest = path;
+        if (!path.StartsWith('$') || path.Length < 2 || path[1] is '.' or '[' || path == "$") return false;
+
+        // Find the longest run of identifier chars after the leading $.
+        var i = 1;
+        while (i < path.Length && (char.IsLetterOrDigit(path[i]) || path[i] == '_')) i++;
+        var name = path.Substring(1, i - 1);
+        var tail = path[i..];
+
+        // Innermost-first: a name shadows outer frames.
+        for (var f = frames.Count - 1; f >= 0; f--)
+        {
+            var frame = frames[f];
+
+            // Direct match: $<name> → frame.Item
+            if (string.Equals(name, frame.Name, StringComparison.Ordinal))
+            {
+                newRoot = frame.Item;
+                rest = tail.Length == 0 ? "$" : "$" + tail;
+                return true;
+            }
+
+            // $<name>Index → integer
+            if (string.Equals(name, frame.Name + "Index", StringComparison.Ordinal))
+            {
+                newRoot = JsonDocument.Parse(frame.Index.ToString()).RootElement;
+                rest = tail.Length == 0 ? "$" : "$" + tail;
+                return true;
+            }
+
+            // $<name>Count → integer
+            if (string.Equals(name, frame.Name + "Count", StringComparison.Ordinal))
+            {
+                newRoot = JsonDocument.Parse(frame.Count.ToString()).RootElement;
+                rest = tail.Length == 0 ? "$" : "$" + tail;
+                return true;
+            }
+        }
+        return false;
     }
 
     private static string StripPrefix(string path)

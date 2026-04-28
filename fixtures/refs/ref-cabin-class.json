@@ -1,0 +1,12 @@
+{
+  "id": "ref-cabin-class",
+  "name": "Cabin class names",
+  "currentVersion": 1,
+  "columns": ["code", "name"],
+  "rows": [
+    { "code": "Y", "name": "Economy" },
+    { "code": "W", "name": "Premium Economy" },
+    { "code": "J", "name": "Business" },
+    { "code": "F", "name": "First" }
+  ]
+}

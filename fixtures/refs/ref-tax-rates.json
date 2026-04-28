@@ -1,0 +1,16 @@
+{
+  "id": "ref-tax-rates",
+  "name": "Air passenger tax rates",
+  "currentVersion": 1,
+  "columns": ["origin", "ageCategory", "code", "amount", "currency"],
+  "rows": [
+    { "origin": "LHR", "ageCategory": "ADT", "code": "GB1", "amount": 26,  "currency": "GBP" },
+    { "origin": "LHR", "ageCategory": "CHD", "code": "GB1", "amount": 13,  "currency": "GBP" },
+    { "origin": "LHR", "ageCategory": "INF", "code": "GB1", "amount": 0,   "currency": "GBP" },
+    { "origin": "LHR", "ageCategory": "ADT", "code": "UB",  "amount": 11,  "currency": "GBP" },
+    { "origin": "LHR", "ageCategory": "CHD", "code": "UB",  "amount": 11,  "currency": "GBP" },
+    { "origin": "LHR", "ageCategory": "INF", "code": "UB",  "amount": 0,   "currency": "GBP" },
+    { "origin": "DXB", "ageCategory": "ADT", "code": "AED", "amount": 35,  "currency": "AED" },
+    { "origin": "DXB", "ageCategory": "CHD", "code": "AED", "amount": 17.5,"currency": "AED" }
+  ]
+}

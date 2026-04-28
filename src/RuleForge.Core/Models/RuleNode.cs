@@ -37,6 +37,8 @@ public enum NodeCategory
     [JsonStringEnumMemberName("calc")] Calc,
     [JsonStringEnumMemberName("constant")] Constant,
     [JsonStringEnumMemberName("mutator")] Mutator,
+    [JsonStringEnumMemberName("iterator")] Iterator,
+    [JsonStringEnumMemberName("merge")] Merge,
 }
 
 public sealed record SubRuleCall(
@@ -45,7 +47,9 @@ public sealed record SubRuleCall(
     IReadOnlyDictionary<string, string> OutputMapping,
     SubRuleErrorMode OnError,
     JsonElement? DefaultValue,
-    JsonElement PinnedVersion);
+    JsonElement PinnedVersion,
+    string? ForEach = null,
+    string? As = null);
 
 [JsonConverter(typeof(JsonStringEnumConverter<SubRuleErrorMode>))]
 public enum SubRuleErrorMode

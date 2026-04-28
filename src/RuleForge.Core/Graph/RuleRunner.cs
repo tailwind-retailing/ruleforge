@@ -1,4 +1,6 @@
-﻿using System.Diagnostics;
+using System.Collections.Immutable;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RuleForge.Core.Evaluators;
@@ -7,24 +9,22 @@ using RuleForge.Core.Models;
 
 namespace RuleForge.Core.Graph;
 
+/// <summary>
+/// Walks a rule's DAG and produces an envelope. Frame-aware: iterator nodes
+/// fan out the downstream sub-graph N times with a new <see cref="IterationFrame"/>
+/// pushed onto the runner's stack; merge nodes close the innermost open scope
+/// and reduce per their <see cref="MergeMode"/>.
+/// </summary>
 public sealed class RuleRunner
 {
     private static readonly JsonSerializerOptions ConfigJsonOptions = AeroJson.Options;
 
-    /// <summary>
-    /// Per-run options. Defaults are non-debug, no sub-rule resolution
-    /// (a node with <c>subRuleCall</c> will error), and a wall-clock now.
-    /// </summary>
     public sealed record Options(
         bool Debug = false,
         IRuleSource? SubRuleSource = null,
         IReferenceSetSource? ReferenceSetSource = null,
         Func<DateTimeOffset>? Clock = null);
 
-    /// <summary>
-    /// Synchronous wrapper for callers that don't need sub-rules. Throws
-    /// if the rule contains a <c>subRuleCall</c> since resolution is async.
-    /// </summary>
     public Envelope Run(Rule rule, JsonElement request, bool debug = false) =>
         RunAsync(rule, request, new Options(Debug: debug)).GetAwaiter().GetResult();
 
@@ -35,14 +35,15 @@ public sealed class RuleRunner
         CancellationToken ct = default)
     {
         options ??= new Options();
-        return RunInternalAsync(rule, request, options, parentCtx: null, ct);
+        return RunInternalAsync(rule, request, options, ct);
     }
+
+    // ─── core run ──────────────────────────────────────────────────────────
 
     private async Task<Envelope> RunInternalAsync(
         Rule rule,
         JsonElement request,
         Options options,
-        IDictionary<string, JsonElement>? parentCtx,
         CancellationToken ct)
     {
         var version = rule.CurrentVersion > 0 ? rule.CurrentVersion : 1;
@@ -51,58 +52,38 @@ public sealed class RuleRunner
         var trace = options.Debug ? new List<TraceEntry>() : null;
 
         ValidateGraph(rule);
+        var graph = AnalyzeGraph(rule);
 
-        var nodes = rule.Nodes.ToDictionary(n => n.Id);
-        var outgoing = rule.Edges.GroupBy(e => e.Source).ToDictionary(g => g.Key, g => g.ToList());
-        var incoming = rule.Edges.GroupBy(e => e.Target).ToDictionary(g => g.Key, g => g.ToList());
+        var inputNode = rule.Nodes.Single(n => n.Data.Category == NodeCategory.Input);
+        var outputNode = rule.Nodes.Single(n => n.Data.Category == NodeCategory.Output);
 
-        var inputNode = rule.Nodes.SingleOrDefault(n => n.Data.Category == NodeCategory.Input)
-            ?? throw new InvalidOperationException("rule has no input node");
-        var outputNode = rule.Nodes.SingleOrDefault(n => n.Data.Category == NodeCategory.Output)
-            ?? throw new InvalidOperationException("rule has no output node");
+        var run = new RunState(graph, request, options, trace);
+        run.Activate(inputNode.Id, FrameStack.Empty);
 
-        var verdicts = new Dictionary<string, Verdict>();
-        var nodeOutputs = new Dictionary<string, JsonElement>();
-        var fired = new HashSet<string>();
-        var activated = new HashSet<string> { inputNode.Id };
-
-        // Each rule run owns its execution context. Sub-rules get a fresh one
-        // (parentCtx is always null at sub-rule entry) â€” they can only see
-        // what's wired through the call's inputMapping at request-build time.
-        var ctx = new Dictionary<string, JsonElement>();
-
-        var queue = new Queue<string>();
-        queue.Enqueue(inputNode.Id);
-
-        while (queue.Count > 0)
+        while (run.Queue.Count > 0)
         {
-            var nodeId = queue.Dequeue();
-            if (fired.Contains(nodeId)) continue;
-            if (!activated.Contains(nodeId)) continue;
+            ct.ThrowIfCancellationRequested();
+            var (nodeId, frames) = run.Queue.Dequeue();
+            var key = run.Key(nodeId, frames);
+            if (run.Fired.Contains(key)) continue;
+            if (!run.Activated.Contains(key)) continue;
 
-            // Wait for all activated upstream deps to fire so multi-input nodes
-            // (logic, output assembly) see complete inputs.
-            if (incoming.TryGetValue(nodeId, out var inEdges))
+            var node = graph.Nodes[nodeId];
+
+            // Wait for all in-this-scope upstream deps to fire before we run.
+            if (!IsReady(node, frames, graph, run))
             {
-                var pendingDeps = inEdges
-                    .Where(e => activated.Contains(e.Source))
-                    .Where(e => !fired.Contains(e.Source))
-                    .ToList();
-                if (pendingDeps.Count > 0)
-                {
-                    queue.Enqueue(nodeId);
-                    continue;
-                }
+                run.Queue.Enqueue((nodeId, frames));
+                continue;
             }
 
-            var node = nodes[nodeId];
             var nodeStarted = DateTimeOffset.UtcNow;
             var sw = Stopwatch.StartNew();
-            var ctxBefore = options.Debug ? new Dictionary<string, JsonElement>(ctx) : null;
+            var ctxBefore = options.Debug ? new Dictionary<string, JsonElement>(run.Ctx) : null;
             string? subRuleRunId = null;
-
-            // Sub-rule call runs first when present, before the host node's logic.
             JsonElement? subRuleResult = null;
+
+            // Sub-rule call (with optional forEach) fires before the host node's logic.
             if (node.Data.SubRuleCall is { } call)
             {
                 if (options.SubRuleSource is null)
@@ -112,74 +93,68 @@ public sealed class RuleRunner
                     return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
                 }
 
-                var subResult = await InvokeSubRuleAsync(call, request, ctx, options, ct);
+                var subResult = await InvokeSubRuleAsync(call, request, run.Ctx, frames, options, ct);
                 subRuleRunId = subResult.RunId;
 
                 switch (subResult.Status)
                 {
                     case SubRuleStatus.Ok:
-                        ApplyOutputMapping(call.OutputMapping, subResult.Envelope!, ctx, nodeOutputs, node.Id);
+                        ApplyOutputMapping(call.OutputMapping, subResult.Envelope!, run.Ctx, run.NodeOutputs, run.Key(node.Id, frames), frames);
                         subRuleResult = subResult.Envelope!.Result;
                         break;
+                    case SubRuleStatus.OkArray:
+                        // forEach path — accumulated array. Map already done inside Invoke.
+                        subRuleResult = subResult.AccumulatedArray;
+                        if (subRuleResult.HasValue)
+                            run.NodeOutputs[run.Key(node.Id, frames)] = subRuleResult.Value;
+                        break;
                     case SubRuleStatus.Default:
-                        ApplyDefault(call, ctx, nodeOutputs, node.Id);
+                        ApplyDefault(call, run.Ctx, run.NodeOutputs, run.Key(node.Id, frames), frames);
                         subRuleResult = call.DefaultValue;
                         break;
                     case SubRuleStatus.Skipped:
-                        // skip = sub-rule emits nothing; node continues without writes.
                         break;
                     case SubRuleStatus.Failed:
                         trace?.Add(new TraceEntry(
-                            node.Id,
-                            IsoUtc(nodeStarted),
-                            sw.ElapsedMilliseconds,
-                            TraceOutcome.Error,
-                            Error: subResult.Error,
-                            SubRuleRunId: subRuleRunId,
-                            CtxRead: ctxBefore));
+                            node.Id, IsoUtc(nodeStarted), sw.ElapsedMilliseconds, TraceOutcome.Error,
+                            Error: subResult.Error, SubRuleRunId: subRuleRunId, CtxRead: ctxBefore));
                         return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
                 }
             }
 
+            // Execute the node itself
             Verdict verdict;
-            JsonElement? nodeOutput = null;
+            JsonElement? nodeOutput;
             try
             {
-                (verdict, nodeOutput) = await ExecuteNodeAsync(node, request, ctx, incoming, verdicts, nodeOutputs, subRuleResult, options, ct);
+                (verdict, nodeOutput) = await ExecuteNodeAsync(node, frames, subRuleResult, graph, run, options, ct);
             }
             catch (Exception e)
             {
                 trace?.Add(new TraceEntry(
-                    node.Id,
-                    IsoUtc(nodeStarted),
-                    sw.ElapsedMilliseconds,
-                    TraceOutcome.Error,
-                    Error: e.Message,
-                    SubRuleRunId: subRuleRunId));
+                    node.Id, IsoUtc(nodeStarted), sw.ElapsedMilliseconds, TraceOutcome.Error,
+                    Error: e.Message, SubRuleRunId: subRuleRunId));
                 return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
             }
             sw.Stop();
 
-            verdicts[node.Id] = verdict;
-            if (nodeOutput.HasValue) nodeOutputs[node.Id] = nodeOutput.Value;
-            fired.Add(node.Id);
+            run.Verdicts[key] = verdict;
+            if (nodeOutput.HasValue) run.NodeOutputs[key] = nodeOutput.Value;
+            run.Fired.Add(key);
 
             if (trace is not null)
             {
                 Dictionary<string, JsonElement>? ctxWritten = null;
                 if (ctxBefore is not null)
                 {
-                    foreach (var kv in ctx)
+                    foreach (var kv in run.Ctx)
                     {
                         if (!ctxBefore.TryGetValue(kv.Key, out var prev) || !JsonElementEquals(prev, kv.Value))
                             (ctxWritten ??= new())[kv.Key] = kv.Value;
                     }
                 }
                 trace.Add(new TraceEntry(
-                    node.Id,
-                    IsoUtc(nodeStarted),
-                    sw.ElapsedMilliseconds,
-                    ToOutcome(verdict),
+                    node.Id, IsoUtc(nodeStarted), sw.ElapsedMilliseconds, ToOutcome(verdict),
                     Output: nodeOutput,
                     CtxRead: ctxBefore is null || ctxBefore.Count == 0 ? null : ctxBefore,
                     CtxWritten: ctxWritten,
@@ -189,66 +164,184 @@ public sealed class RuleRunner
             if (verdict == Verdict.Error)
                 return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
 
-            if (outgoing.TryGetValue(node.Id, out var outs))
+            // Route outgoing edges. Iterator nodes fan out at deeper frames;
+            // when an outgoing edge targets a merge, the merge runs at the
+            // popped frame stack (one level above this node).
+            if (node.Data.Category == NodeCategory.Iterator)
             {
-                foreach (var edge in outs)
+                FanOutIterator(node, frames, verdict, graph, run);
+            }
+            else
+            {
+                if (graph.Outgoing.TryGetValue(node.Id, out var outs))
                 {
-                    if (!EdgeRouter.Matches(verdict, edge.Branch)) continue;
-                    activated.Add(edge.Target);
-                    queue.Enqueue(edge.Target);
+                    foreach (var edge in outs)
+                    {
+                        if (!EdgeRouter.Matches(verdict, edge.Branch)) continue;
+                        var targetIsMerge = graph.Nodes[edge.Target].Data.Category == NodeCategory.Merge;
+                        var targetFrames = targetIsMerge ? frames.Pop() : frames;
+                        run.Activate(edge.Target, targetFrames);
+                    }
                 }
             }
         }
 
-        if (!fired.Contains(outputNode.Id))
+        // Output node assembly
+        var outputKey = run.Key(outputNode.Id, FrameStack.Empty);
+        if (!run.Fired.Contains(outputKey))
             return new Envelope(rule.Id, version, Decision.Skip, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
 
-        var result = AssembleResult(outputNode, incoming, nodeOutputs, ctx);
+        var result = AssembleResult(outputNode, graph, run);
         return new Envelope(rule.Id, version, Decision.Apply, IsoUtc(startedAtUtc), result, trace, totalSw?.ElapsedMilliseconds);
     }
 
-    // â”€â”€â”€ node execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── readiness ─────────────────────────────────────────────────────────
+
+    private static bool IsReady(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (!graph.Incoming.TryGetValue(node.Id, out var inEdges)) return true;
+
+        foreach (var edge in inEdges)
+        {
+            var src = graph.Nodes[edge.Source];
+
+            // The iterator that opened this scope sits one frame above us. It
+            // doesn't produce a typed output; its work was the fan-out. Skip
+            // the readiness check for it.
+            if (src.Data.Category == NodeCategory.Iterator)
+            {
+                continue;
+            }
+
+            // Merge node looks at upstream across the closed scope: not a
+            // single (src, frames) but the union of (src, frames+[*]) for the
+            // closed iterator's iterations.
+            if (node.Data.Category == NodeCategory.Merge)
+            {
+                if (!run.AllInnerIterationsCompleteFor(node.Id, frames, graph)) return false;
+                continue;
+            }
+
+            // Standard: upstream must have fired at the same frames. If the
+            // edge wasn't activated for this frames (verdict didn't match
+            // branch), this dep isn't pending — skip.
+            var upKey = run.Key(edge.Source, frames);
+            if (!run.Activated.Contains(upKey)) continue;
+            if (!run.Fired.Contains(upKey)) return false;
+        }
+        return true;
+    }
+
+    // ─── iterator fan-out ──────────────────────────────────────────────────
+
+    private void FanOutIterator(RuleNode node, FrameStack frames, Verdict verdict, GraphInfo graph, RunState run)
+    {
+        if (verdict != Verdict.Pass) return;
+
+        var cfg = ParseConfig<IteratorConfig>(node, "iterator");
+        if (string.IsNullOrEmpty(cfg.Source)) throw new InvalidOperationException($"iterator '{node.Id}' missing source");
+        if (string.IsNullOrEmpty(cfg.As)) throw new InvalidOperationException($"iterator '{node.Id}' missing as");
+
+        var arr = JsonPath.Resolve(run.Request, cfg.Source, frames.ToList())
+                          .Where(e => e.HasValue && e.Value.ValueKind == JsonValueKind.Array)
+                          .Select(e => e!.Value)
+                          .FirstOrDefault();
+
+        if (arr.ValueKind != JsonValueKind.Array)
+        {
+            // Source resolves to a single value, not an array. Treat as 1-item iteration.
+            var singleResolved = JsonPath.Resolve(run.Request, cfg.Source, frames.ToList()).FirstOrDefault();
+            if (!singleResolved.HasValue)
+            {
+                run.RecordIteratorCount(node.Id, frames, 0);
+                return;
+            }
+            run.RecordIteratorCount(node.Id, frames, 1);
+            var f = new IterationFrame(cfg.As, singleResolved.Value, 0, 1);
+            var fStack = frames.Push(f);
+            if (graph.Outgoing.TryGetValue(node.Id, out var outs0))
+                foreach (var edge in outs0)
+                    if (EdgeRouter.Matches(verdict, edge.Branch))
+                        run.Activate(edge.Target, fStack);
+            return;
+        }
+
+        var items = arr.EnumerateArray().ToList();
+        run.RecordIteratorCount(node.Id, frames, items.Count);
+
+        if (items.Count == 0)
+        {
+            // Empty source: no body iterations, but the closing merge still
+            // needs to fire so the rule produces a sensible empty-array / 0 /
+            // first-of-empty result.
+            if (graph.IteratorClosingMerge.TryGetValue(node.Id, out var mergeId))
+                run.Activate(mergeId, frames);
+            return;
+        }
+
+        if (graph.Outgoing.TryGetValue(node.Id, out var outs))
+        {
+            for (var i = 0; i < items.Count; i++)
+            {
+                var f = new IterationFrame(cfg.As, items[i], i, items.Count);
+                var fStack = frames.Push(f);
+                foreach (var edge in outs)
+                {
+                    if (!EdgeRouter.Matches(verdict, edge.Branch)) continue;
+                    run.Activate(edge.Target, fStack);
+                }
+            }
+        }
+    }
+
+    // ─── node execution ────────────────────────────────────────────────────
 
     private async Task<(Verdict, JsonElement?)> ExecuteNodeAsync(
         RuleNode node,
-        JsonElement request,
-        IDictionary<string, JsonElement> ctx,
-        Dictionary<string, List<RuleEdge>> incoming,
-        Dictionary<string, Verdict> verdicts,
-        Dictionary<string, JsonElement> nodeOutputs,
+        FrameStack frames,
         JsonElement? subRuleResult,
+        GraphInfo graph,
+        RunState run,
         Options options,
         CancellationToken ct)
     {
         switch (node.Data.Category)
         {
             case NodeCategory.Input:
-                return (Verdict.Pass, request);
+                return (Verdict.Pass, run.Request);
 
             case NodeCategory.Output:
                 return (Verdict.Pass, null);
 
             case NodeCategory.Filter:
-                return (ExecuteFilter(node, request, ctx, options), null);
+                return (ExecuteFilter(node, frames, run, options), null);
 
             case NodeCategory.Logic:
-                return (ExecuteLogic(node, incoming, verdicts), null);
+                return (ExecuteLogic(node, frames, graph, run), null);
 
             case NodeCategory.Constant:
                 return (Verdict.Pass, ReadConfigField(node, "value"));
 
             case NodeCategory.Product:
-                return (Verdict.Pass, ReadProductOutput(node, subRuleResult, nodeOutputs, incoming, ctx));
+                return (Verdict.Pass, ReadProductOutput(node, frames, subRuleResult, run));
 
             case NodeCategory.Mutator:
-                return await ExecuteMutatorAsync(node, request, ctx, incoming, nodeOutputs, options, ct);
+                return await ExecuteMutatorAsync(node, frames, graph, run, options, ct);
 
             case NodeCategory.Calc:
-                return (Verdict.Pass, ExecuteCalc(node, request, ctx, incoming, nodeOutputs));
+                return (Verdict.Pass, ExecuteCalc(node, frames, graph, run));
+
+            case NodeCategory.Iterator:
+                // Iterator emits a Pass to drive routing — fan-out happens in caller.
+                return (Verdict.Pass, null);
+
+            case NodeCategory.Merge:
+                return (Verdict.Pass, ExecuteMerge(node, frames, graph, run));
+
+            case NodeCategory.Reference:
+                return await ExecuteReferenceAsync(node, frames, run, options, ct);
 
             case NodeCategory.RuleRef:
-                // ruleRef is a wrapper around subRuleCall â€” the call ran upstream of
-                // ExecuteNode; emit the sub-rule result as this node's output and pass.
                 return (Verdict.Pass, subRuleResult);
 
             default:
@@ -257,19 +350,20 @@ public sealed class RuleRunner
         }
     }
 
-    private Verdict ExecuteFilter(RuleNode node, JsonElement request, IDictionary<string, JsonElement> ctx, Options options)
+    // ─── filter ────────────────────────────────────────────────────────────
+
+    private Verdict ExecuteFilter(RuleNode node, FrameStack frames, RunState run, Options options)
     {
         if (node.Data.Config is null)
             throw new InvalidOperationException(
-                $"filter node '{node.Id}' has no config. " +
-                "AERO admin must inline the structured filter config before publish.");
-
+                $"filter node '{node.Id}' has no config. AERO admin must inline the structured filter config before publish.");
         var raw = node.Data.Config.Value;
         EnsureStructuredFilterShape(node.Id, raw);
 
-        var ctxElement = ctx.Count == 0 ? (JsonElement?)null : DictToJsonElement(ctx);
-        var fctx = new StringFilterEvaluator.Context(request, ctxElement);
-
+        // For frame-aware paths inside the filter source, we resolve the path
+        // ourselves (with the runner's frame stack) and feed a literal-source
+        // shape into the underlying evaluator.
+        var fctx = BuildFilterContext(run, frames);
         var kind = ClassifyFilter(node, raw);
         try
         {
@@ -277,21 +371,20 @@ public sealed class RuleRunner
             {
                 case FilterKind.Number:
                 {
-                    var cfg = raw.Deserialize<NumberFilterConfig>(ConfigJsonOptions)
-                              ?? throw new InvalidOperationException("filter config deserialised to null");
+                    var cfg = raw.Deserialize<NumberFilterConfig>(ConfigJsonOptions)!;
+                    cfg = ResolveSourceForFrames(cfg, run, frames);
                     return NumberFilterEvaluator.Evaluate(cfg, fctx).Verdict;
                 }
                 case FilterKind.Date:
                 {
-                    var cfg = raw.Deserialize<DateFilterConfig>(ConfigJsonOptions)
-                              ?? throw new InvalidOperationException("filter config deserialised to null");
+                    var cfg = raw.Deserialize<DateFilterConfig>(ConfigJsonOptions)!;
+                    cfg = ResolveSourceForFrames(cfg, run, frames);
                     return DateFilterEvaluator.Evaluate(cfg, fctx, options.Clock).Verdict;
                 }
-                case FilterKind.String:
                 default:
                 {
-                    var cfg = raw.Deserialize<StringFilterConfig>(ConfigJsonOptions)
-                              ?? throw new InvalidOperationException("filter config deserialised to null");
+                    var cfg = raw.Deserialize<StringFilterConfig>(ConfigJsonOptions)!;
+                    cfg = ResolveSourceForFrames(cfg, run, frames);
                     return StringFilterEvaluator.Evaluate(cfg, fctx).Verdict;
                 }
             }
@@ -302,6 +395,71 @@ public sealed class RuleRunner
                 $"filter node '{node.Id}' config ({kind}) could not be parsed: {e.Message}", e);
         }
     }
+
+    private StringFilterEvaluator.Context BuildFilterContext(RunState run, FrameStack frames)
+    {
+        // The filter evaluators don't know about iteration frames natively.
+        // We pre-resolve any frame-rooted path (`$pax.tier`) by rewriting the
+        // source to `literal` with the resolved value before handing off.
+        // Context (`$ctx`) is unchanged.
+        var ctxEl = run.Ctx.Count == 0 ? (JsonElement?)null : DictToJsonElement(run.Ctx);
+        return new StringFilterEvaluator.Context(run.Request, ctxEl);
+    }
+
+    private StringFilterConfig ResolveSourceForFrames(StringFilterConfig cfg, RunState run, FrameStack frames)
+    {
+        if (cfg.Source.Kind != SourceKind.Request || string.IsNullOrEmpty(cfg.Source.Path)) return cfg;
+        if (frames.Count == 0) return cfg;
+        if (!cfg.Source.Path!.StartsWith('$') || cfg.Source.Path.Length < 2) return cfg;
+        if (cfg.Source.Path[1] is '.' or '[') return cfg;
+
+        // Path starts with $<name> — pre-resolve against the frame stack.
+        var resolved = JsonPath.Resolve(run.Request, cfg.Source.Path, frames.ToList()).FirstOrDefault();
+        if (!resolved.HasValue) return cfg;
+        // Substitute the source: replace the frame-rooted path with a one-shot
+        // request literal at a synthetic key.
+        return cfg with { Source = new StringFilterSource(SourceKind.Literal, Literal: ToScalarString(resolved.Value)) };
+    }
+
+    private NumberFilterConfig ResolveSourceForFrames(NumberFilterConfig cfg, RunState run, FrameStack frames)
+    {
+        if (cfg.Source.Kind != SourceKind.Request || string.IsNullOrEmpty(cfg.Source.Path)) return cfg;
+        if (frames.Count == 0) return cfg;
+        if (!cfg.Source.Path!.StartsWith('$') || cfg.Source.Path.Length < 2) return cfg;
+        if (cfg.Source.Path[1] is '.' or '[') return cfg;
+
+        var resolved = JsonPath.Resolve(run.Request, cfg.Source.Path, frames.ToList()).FirstOrDefault();
+        if (!resolved.HasValue) return cfg;
+        if (resolved.Value.ValueKind == JsonValueKind.Number && resolved.Value.TryGetDouble(out var d))
+            return cfg with { Source = new NumberFilterSource(SourceKind.Literal, Literal: d) };
+        if (resolved.Value.ValueKind == JsonValueKind.String &&
+            double.TryParse(resolved.Value.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var ds))
+            return cfg with { Source = new NumberFilterSource(SourceKind.Literal, Literal: ds) };
+        return cfg;
+    }
+
+    private DateFilterConfig ResolveSourceForFrames(DateFilterConfig cfg, RunState run, FrameStack frames)
+    {
+        if (cfg.Source.Kind != SourceKind.Request || string.IsNullOrEmpty(cfg.Source.Path)) return cfg;
+        if (frames.Count == 0) return cfg;
+        if (!cfg.Source.Path!.StartsWith('$') || cfg.Source.Path.Length < 2) return cfg;
+        if (cfg.Source.Path[1] is '.' or '[') return cfg;
+
+        var resolved = JsonPath.Resolve(run.Request, cfg.Source.Path, frames.ToList()).FirstOrDefault();
+        if (!resolved.HasValue) return cfg;
+        if (resolved.Value.ValueKind == JsonValueKind.String)
+            return cfg with { Source = new DateFilterSource(SourceKind.Literal, Literal: resolved.Value.GetString()) };
+        return cfg;
+    }
+
+    private static string? ToScalarString(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.String => el.GetString(),
+        JsonValueKind.Number => el.GetRawText(),
+        JsonValueKind.True => "true",
+        JsonValueKind.False => "false",
+        _ => null,
+    };
 
     private enum FilterKind { String, Number, Date }
 
@@ -316,248 +474,31 @@ public sealed class RuleRunner
         {
             if (cmp.TryGetProperty("granularity", out _)) return FilterKind.Date;
             if (cmp.TryGetProperty("unit", out _)) return FilterKind.Date;
-
             if (cmp.TryGetProperty("operator", out var op) && op.ValueKind == JsonValueKind.String)
             {
                 var opName = op.GetString() ?? string.Empty;
                 if (opName is "before" or "after" or "within_last" or "within_next") return FilterKind.Date;
-                if (opName is "gt" or "gte" or "lt" or "lte" or "between" or "not_between")
-                    return FilterKind.Number;
+                if (opName is "gt" or "gte" or "lt" or "lte" or "between" or "not_between") return FilterKind.Number;
             }
         }
         return FilterKind.String;
     }
 
-    private static Verdict ExecuteLogic(
-        RuleNode node,
-        Dictionary<string, List<RuleEdge>> incoming,
-        Dictionary<string, Verdict> verdicts)
+    // ─── logic ─────────────────────────────────────────────────────────────
+
+    private static Verdict ExecuteLogic(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
     {
         var op = LogicEvaluator.Parse(node.Data.TemplateId, node.Data.Label);
-        var inEdges = incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
         var inputs = inEdges
             .Select(e => e.Source)
             .Distinct()
-            .Select(src => verdicts.TryGetValue(src, out var v) ? v : Verdict.Skip)
+            .Select(src => run.Verdicts.TryGetValue(run.Key(src, frames), out var v) ? v : Verdict.Skip)
             .ToList();
         return LogicEvaluator.Apply(op, inputs);
     }
 
-    // â”€â”€â”€ mutator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    private async Task<(Verdict, JsonElement?)> ExecuteMutatorAsync(
-        RuleNode node,
-        JsonElement request,
-        IDictionary<string, JsonElement> ctx,
-        Dictionary<string, List<RuleEdge>> incoming,
-        Dictionary<string, JsonElement> nodeOutputs,
-        Options options,
-        CancellationToken ct)
-    {
-        if (node.Data.Config is null)
-            throw new InvalidOperationException($"mutator node '{node.Id}' has no config");
-
-        MutatorConfig cfg;
-        try
-        {
-            cfg = node.Data.Config.Value.Deserialize<MutatorConfig>(ConfigJsonOptions)
-                  ?? throw new InvalidOperationException("mutator config deserialised to null");
-        }
-        catch (JsonException e)
-        {
-            throw new InvalidOperationException(
-                $"mutator node '{node.Id}' config could not be parsed: {e.Message}", e);
-        }
-
-        if (string.IsNullOrEmpty(cfg.Target))
-            throw new InvalidOperationException($"mutator node '{node.Id}' is missing 'target'");
-
-        // Find the upstream object to mutate. A mutator with a single
-        // upstream node uses that node's output. With zero upstream outputs
-        // (e.g. mutator wired to a logic gate that has no output object) we
-        // start from an empty object so 'set property' still works.
-        var inEdges = incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
-        var upstreamOutputs = inEdges.Select(e => e.Source).Distinct()
-            .Where(s => nodeOutputs.ContainsKey(s))
-            .Select(s => nodeOutputs[s])
-            .ToList();
-        if (upstreamOutputs.Count > 1)
-            throw new InvalidOperationException(
-                $"mutator node '{node.Id}' has {upstreamOutputs.Count} upstream outputs â€” exactly one required");
-
-        var baseObj = upstreamOutputs.Count == 1 && upstreamOutputs[0].ValueKind == JsonValueKind.Object
-            ? JsonNode.Parse(upstreamOutputs[0].GetRawText())!.AsObject()
-            : new JsonObject();
-
-        // Compute the new value.
-        JsonElement? newValue;
-        if (cfg.Lookup is not null)
-        {
-            if (options.ReferenceSetSource is null)
-                throw new InvalidOperationException(
-                    $"mutator node '{node.Id}' uses lookup but no ReferenceSetSource was configured");
-
-            var refSet = await options.ReferenceSetSource.GetByIdAsync(cfg.Lookup.ReferenceId, ct)
-                         ?? throw new InvalidOperationException(
-                             $"mutator node '{node.Id}': reference set '{cfg.Lookup.ReferenceId}' not found");
-
-            newValue = LookupRefSet(refSet, cfg.Lookup, request, ctx);
-        }
-        else if (cfg.From is not null)
-        {
-            newValue = ResolveFromPath(cfg.From, request, ctx);
-        }
-        else if (cfg.Value.HasValue)
-        {
-            newValue = cfg.Value.Value;
-        }
-        else
-        {
-            throw new InvalidOperationException(
-                $"mutator node '{node.Id}' must specify 'value', 'from' or 'lookup'");
-        }
-
-        if (!newValue.HasValue)
-        {
-            switch (cfg.OnMissing)
-            {
-                case OnLookupMissing.Leave:
-                    break; // baseObj keeps whatever was there
-                case OnLookupMissing.Clear:
-                    baseObj[cfg.Target] = null;
-                    break;
-                case OnLookupMissing.Error:
-                    return (Verdict.Error, null);
-            }
-        }
-        else
-        {
-            baseObj[cfg.Target] = JsonNode.Parse(newValue.Value.GetRawText());
-        }
-
-        var output = JsonDocument.Parse(baseObj.ToJsonString()).RootElement;
-        return (Verdict.Pass, output);
-    }
-
-    private static JsonElement? LookupRefSet(
-        ReferenceSet refSet,
-        LookupSpec spec,
-        JsonElement request,
-        IDictionary<string, JsonElement> ctx)
-    {
-        // Resolve each match value once.
-        var match = new Dictionary<string, JsonElement?>(spec.MatchOn.Count);
-        foreach (var kv in spec.MatchOn)
-            match[kv.Key] = ResolveFromPath(kv.Value, request, ctx);
-
-        foreach (var row in refSet.Rows)
-        {
-            var allMatch = true;
-            foreach (var (col, expected) in match)
-            {
-                if (!row.TryGetValue(col, out var actual))
-                {
-                    allMatch = false;
-                    break;
-                }
-                if (!expected.HasValue || !RefValueEquals(actual, expected.Value))
-                {
-                    allMatch = false;
-                    break;
-                }
-            }
-            if (allMatch && row.TryGetValue(spec.ValueColumn, out var v))
-                return v;
-        }
-        return null;
-    }
-
-    /// <summary>
-    /// Loose equality used for reference-set match: number-vs-number compares
-    /// numerically, string-vs-string compares verbatim, anything else falls
-    /// back to GetRawText() comparison.
-    /// </summary>
-    private static bool RefValueEquals(JsonElement a, JsonElement b)
-    {
-        if (a.ValueKind == JsonValueKind.Number && b.ValueKind == JsonValueKind.Number)
-            return a.GetDouble() == b.GetDouble();
-        if (a.ValueKind == JsonValueKind.String && b.ValueKind == JsonValueKind.String)
-            return a.GetString() == b.GetString();
-        return a.GetRawText() == b.GetRawText();
-    }
-
-    /// <summary>
-    /// Resolve a JSONPath against the request (default) or the execution
-    /// context (when prefixed with <c>$ctx.</c>).
-    /// </summary>
-    private static JsonElement? ResolveFromPath(
-        string path,
-        JsonElement request,
-        IDictionary<string, JsonElement> ctx)
-    {
-        if (path.StartsWith("$ctx."))
-        {
-            if (ctx.Count == 0) return null;
-            var ctxEl = DictToJsonElement(ctx);
-            return JsonPath.Resolve(ctxEl, path).FirstOrDefault();
-        }
-        return JsonPath.Resolve(request, path).FirstOrDefault();
-    }
-
-    // â”€â”€â”€ calc â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-    private static JsonElement? ExecuteCalc(
-        RuleNode node,
-        JsonElement request,
-        IDictionary<string, JsonElement> ctx,
-        Dictionary<string, List<RuleEdge>> incoming,
-        Dictionary<string, JsonElement> nodeOutputs)
-    {
-        if (node.Data.Config is null)
-            throw new InvalidOperationException($"calc node '{node.Id}' has no config");
-
-        CalcConfig cfg;
-        try
-        {
-            cfg = node.Data.Config.Value.Deserialize<CalcConfig>(ConfigJsonOptions)
-                  ?? throw new InvalidOperationException("calc config deserialised to null");
-        }
-        catch (JsonException e)
-        {
-            throw new InvalidOperationException(
-                $"calc node '{node.Id}' config could not be parsed: {e.Message}", e);
-        }
-
-        if (string.IsNullOrEmpty(cfg.Expression))
-            throw new InvalidOperationException($"calc node '{node.Id}' is missing 'expression'");
-
-        // Locate the (single) upstream output to feed in as variables.
-        var inEdges = incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
-        var upstreamOutputs = inEdges.Select(e => e.Source).Distinct()
-            .Where(s => nodeOutputs.ContainsKey(s))
-            .Select(s => nodeOutputs[s])
-            .ToList();
-        if (upstreamOutputs.Count > 1)
-            throw new InvalidOperationException(
-                $"calc node '{node.Id}' has {upstreamOutputs.Count} upstream outputs â€” exactly one required");
-
-        var upstream = upstreamOutputs.Count == 1 ? upstreamOutputs[0] : (JsonElement?)null;
-        var computed = CalcEvaluator.Evaluate(cfg.Expression, upstream, ctx, request);
-
-        // No target â†’ emit the raw computed value as this node's output.
-        if (string.IsNullOrEmpty(cfg.Target)) return computed;
-
-        // With a target â†’ replace the field on a copy of the upstream object.
-        var baseObj = upstream is { ValueKind: JsonValueKind.Object } u
-            ? JsonNode.Parse(u.GetRawText())!.AsObject()
-            : new JsonObject();
-        baseObj[cfg.Target] = computed.HasValue
-            ? JsonNode.Parse(computed.Value.GetRawText())
-            : null;
-        return JsonDocument.Parse(baseObj.ToJsonString()).RootElement;
-    }
-
-    // â”€â”€â”€ product / constant â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── product / constant ────────────────────────────────────────────────
 
     private static JsonElement? ReadConfigField(RuleNode node, string field)
     {
@@ -566,28 +507,14 @@ public sealed class RuleRunner
         return cfg.ValueKind == JsonValueKind.Object && cfg.TryGetProperty(field, out var v) ? v : null;
     }
 
-    /// <summary>
-    /// Product node output. Order of precedence:
-    ///   1. <c>data.config.output</c> â€” explicit object literal
-    ///   2. <c>data.config.outputSchema</c> â€” array of {key, value} pairs (template style)
-    ///   3. The sub-rule result, if a subRuleCall provided one
-    /// Unknown placeholders <c>${ctx.X}</c> in any string value are resolved
-    /// from the run's execution context.
-    /// </summary>
-    private static JsonElement? ReadProductOutput(
-        RuleNode node,
-        JsonElement? subRuleResult,
-        Dictionary<string, JsonElement> nodeOutputs,
-        Dictionary<string, List<RuleEdge>> incoming,
-        IDictionary<string, JsonElement> ctx)
+    private static JsonElement? ReadProductOutput(RuleNode node, FrameStack frames, JsonElement? subRuleResult, RunState run)
     {
         if (node.Data.Config is { } cfg && cfg.ValueKind == JsonValueKind.Object)
         {
             if (cfg.TryGetProperty("output", out var direct))
-                return ResolveCtxPlaceholders(direct, ctx);
-
+                return ResolveCtxPlaceholders(direct, run.Ctx, run.Request, frames);
             if (cfg.TryGetProperty("outputSchema", out var schema) && schema.ValueKind == JsonValueKind.Array)
-                return ResolveCtxPlaceholders(SchemaArrayToObject(schema), ctx);
+                return ResolveCtxPlaceholders(SchemaArrayToObject(schema), run.Ctx, run.Request, frames);
         }
         return subRuleResult;
     }
@@ -606,21 +533,18 @@ public sealed class RuleRunner
         return JsonDocument.Parse(obj.ToJsonString()).RootElement;
     }
 
-    /// <summary>
-    /// Recursively walk a JsonElement and replace any string of the form
-    /// <c>"${ctx.path}"</c> with the JSON value at that ctx path.
-    /// </summary>
-    private static JsonElement ResolveCtxPlaceholders(JsonElement input, IDictionary<string, JsonElement> ctx)
+    private static JsonElement ResolveCtxPlaceholders(
+        JsonElement input,
+        IDictionary<string, JsonElement> ctx,
+        JsonElement request,
+        FrameStack frames)
     {
-        if (ctx.Count == 0) return input;
-        if (!ContainsCtxPlaceholder(input)) return input;
-
+        if (!ContainsPlaceholder(input)) return input;
         var node = JsonNode.Parse(input.GetRawText());
-        var ctxElement = DictToJsonElement(ctx);
-        Replace(node, ctxElement);
+        Replace(node);
         return JsonDocument.Parse(node!.ToJsonString()).RootElement;
 
-        static void Replace(JsonNode? n, JsonElement ctxEl)
+        void Replace(JsonNode? n)
         {
             switch (n)
             {
@@ -628,14 +552,14 @@ public sealed class RuleRunner
                     foreach (var key in obj.Select(p => p.Key).ToList())
                     {
                         var child = obj[key];
-                        if (child is JsonValue v && v.TryGetValue(out string? s) && IsCtxPlaceholder(s, out var path))
+                        if (child is JsonValue v && v.TryGetValue(out string? s) && IsPlaceholder(s, out var path, out var rooted))
                         {
-                            var resolved = JsonPath.Resolve(ctxEl, path).FirstOrDefault();
+                            var resolved = ResolvePath(path, rooted);
                             obj[key] = resolved.HasValue ? JsonNode.Parse(resolved.Value.GetRawText()) : null;
                         }
                         else
                         {
-                            Replace(child, ctxEl);
+                            Replace(child);
                         }
                     }
                     break;
@@ -643,78 +567,325 @@ public sealed class RuleRunner
                     for (var i = 0; i < arr.Count; i++)
                     {
                         var child = arr[i];
-                        if (child is JsonValue v && v.TryGetValue(out string? s) && IsCtxPlaceholder(s, out var path))
+                        if (child is JsonValue v && v.TryGetValue(out string? s) && IsPlaceholder(s, out var path, out var rooted))
                         {
-                            var resolved = JsonPath.Resolve(ctxEl, path).FirstOrDefault();
+                            var resolved = ResolvePath(path, rooted);
                             arr[i] = resolved.HasValue ? JsonNode.Parse(resolved.Value.GetRawText()) : null;
                         }
                         else
                         {
-                            Replace(child, ctxEl);
+                            Replace(child);
                         }
                     }
                     break;
             }
         }
-    }
 
-    private static bool ContainsCtxPlaceholder(JsonElement el)
-    {
-        switch (el.ValueKind)
+        JsonElement? ResolvePath(string path, PlaceholderRoot rooted) => rooted switch
         {
-            case JsonValueKind.String:
-                return IsCtxPlaceholder(el.GetString(), out _);
-            case JsonValueKind.Object:
-                foreach (var p in el.EnumerateObject())
-                    if (ContainsCtxPlaceholder(p.Value)) return true;
-                return false;
-            case JsonValueKind.Array:
-                foreach (var item in el.EnumerateArray())
-                    if (ContainsCtxPlaceholder(item)) return true;
-                return false;
-            default:
-                return false;
-        }
+            PlaceholderRoot.Ctx     => JsonPath.Resolve(DictToJsonElement(ctx), "$" + path).FirstOrDefault(),
+            PlaceholderRoot.Frame   => JsonPath.Resolve(request, path, frames.ToList()).FirstOrDefault(),
+            PlaceholderRoot.Request => JsonPath.Resolve(request, "$" + path).FirstOrDefault(),
+            _                       => null,
+        };
     }
 
-    private static bool IsCtxPlaceholder(string? s, out string path)
+    private enum PlaceholderRoot { Ctx, Frame, Request }
+
+    private static bool ContainsPlaceholder(JsonElement el)
     {
-        path = string.Empty;
+        return el.ValueKind switch
+        {
+            JsonValueKind.String => IsPlaceholder(el.GetString(), out _, out _),
+            JsonValueKind.Object => el.EnumerateObject().Any(p => ContainsPlaceholder(p.Value)),
+            JsonValueKind.Array => el.EnumerateArray().Any(ContainsPlaceholder),
+            _ => false,
+        };
+    }
+
+    private static bool IsPlaceholder(string? s, out string path, out PlaceholderRoot root)
+    {
+        path = string.Empty; root = PlaceholderRoot.Ctx;
         if (string.IsNullOrEmpty(s)) return false;
-        if (!s.StartsWith("${ctx.") || !s.EndsWith("}")) return false;
-        path = "$ctx." + s.Substring("${ctx.".Length, s.Length - "${ctx.".Length - 1);
+        if (!s.StartsWith("${") || !s.EndsWith("}")) return false;
+        var inner = s.Substring(2, s.Length - 3);
+
+        if (inner.StartsWith("ctx.")) { path = "." + inner.Substring("ctx.".Length); root = PlaceholderRoot.Ctx; return true; }
+        if (inner.StartsWith("$"))
+        {
+            // ${$pax.id} — frame-rooted
+            path = inner;
+            root = PlaceholderRoot.Frame;
+            return true;
+        }
+        // Plain "${field.x}" — treated as request-rooted
+        path = "." + inner;
+        root = PlaceholderRoot.Request;
         return true;
     }
 
-    // â”€â”€â”€ output assembly â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── mutator ───────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// The output node's result. Resolution order:
-    ///   1. Legacy literal: <c>output.config.result</c> (used by v1â€“v4)
-    ///   2. Single upstream output â†’ use it as-is
-    ///   3. Multiple upstream outputs â†’ shallow-merge all object outputs
-    ///      (later wins on key conflict), with ctx placeholders resolved
-    /// </summary>
-    private static JsonElement? AssembleResult(
-        RuleNode outputNode,
-        Dictionary<string, List<RuleEdge>> incoming,
-        Dictionary<string, JsonElement> nodeOutputs,
-        IDictionary<string, JsonElement> ctx)
+    private async Task<(Verdict, JsonElement?)> ExecuteMutatorAsync(
+        RuleNode node, FrameStack frames, GraphInfo graph, RunState run, Options options, CancellationToken ct)
     {
-        if (outputNode.Data.Config is { } cfg && cfg.ValueKind == JsonValueKind.Object &&
-            cfg.TryGetProperty("result", out var literal))
+        if (node.Data.Config is null) throw new InvalidOperationException($"mutator '{node.Id}' has no config");
+        var cfg = ParseConfig<MutatorConfig>(node, "mutator");
+        if (string.IsNullOrEmpty(cfg.Target))
+            throw new InvalidOperationException($"mutator '{node.Id}' missing target");
+
+        // Find single upstream output at THIS frame.
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var upstream = inEdges
+            .Select(e => e.Source).Distinct()
+            .Where(s => run.NodeOutputs.ContainsKey(run.Key(s, frames)))
+            .Select(s => run.NodeOutputs[run.Key(s, frames)])
+            .ToList();
+        if (upstream.Count > 1)
+            throw new InvalidOperationException($"mutator '{node.Id}' has {upstream.Count} upstream outputs — exactly one required");
+
+        var baseObj = upstream.Count == 1 && upstream[0].ValueKind == JsonValueKind.Object
+            ? JsonNode.Parse(upstream[0].GetRawText())!.AsObject()
+            : new JsonObject();
+
+        JsonElement? newValue;
+        if (cfg.Lookup is not null)
         {
-            return ResolveCtxPlaceholders(literal, ctx);
+            if (options.ReferenceSetSource is null)
+                throw new InvalidOperationException($"mutator '{node.Id}' uses lookup but no ReferenceSetSource configured");
+
+            var refSet = await options.ReferenceSetSource.GetByIdAsync(cfg.Lookup.ReferenceId, ct)
+                         ?? throw new InvalidOperationException($"mutator '{node.Id}': reference set '{cfg.Lookup.ReferenceId}' not found");
+            newValue = LookupRefSet(refSet, cfg.Lookup, run.Request, run.Ctx, frames);
+        }
+        else if (cfg.From is not null)
+        {
+            newValue = ResolveFromPath(cfg.From, run.Request, run.Ctx, frames);
+        }
+        else if (cfg.Value.HasValue)
+        {
+            newValue = cfg.Value.Value;
+        }
+        else
+        {
+            throw new InvalidOperationException($"mutator '{node.Id}' must specify value, from, or lookup");
         }
 
-        var inEdges = incoming.GetValueOrDefault(outputNode.Id) ?? new List<RuleEdge>();
+        if (!newValue.HasValue)
+        {
+            switch (cfg.OnMissing)
+            {
+                case OnLookupMissing.Leave: break;
+                case OnLookupMissing.Clear: baseObj[cfg.Target] = null; break;
+                case OnLookupMissing.Error: return (Verdict.Error, null);
+            }
+        }
+        else
+        {
+            baseObj[cfg.Target] = JsonNode.Parse(newValue.Value.GetRawText());
+        }
+        return (Verdict.Pass, JsonDocument.Parse(baseObj.ToJsonString()).RootElement);
+    }
+
+    private static JsonElement? LookupRefSet(
+        ReferenceSet refSet, LookupSpec spec,
+        JsonElement request, IDictionary<string, JsonElement> ctx, FrameStack frames)
+    {
+        var match = new Dictionary<string, JsonElement?>(spec.MatchOn.Count);
+        foreach (var kv in spec.MatchOn)
+            match[kv.Key] = ResolveFromPath(kv.Value, request, ctx, frames);
+
+        foreach (var row in refSet.Rows)
+        {
+            var allMatch = true;
+            foreach (var (col, expected) in match)
+            {
+                if (!row.TryGetValue(col, out var actual)) { allMatch = false; break; }
+                if (!expected.HasValue || !RefValueEquals(actual, expected.Value)) { allMatch = false; break; }
+            }
+            if (allMatch && row.TryGetValue(spec.ValueColumn, out var v)) return v;
+        }
+        return null;
+    }
+
+    private static bool RefValueEquals(JsonElement a, JsonElement b)
+    {
+        if (a.ValueKind == JsonValueKind.Number && b.ValueKind == JsonValueKind.Number) return a.GetDouble() == b.GetDouble();
+        if (a.ValueKind == JsonValueKind.String && b.ValueKind == JsonValueKind.String) return a.GetString() == b.GetString();
+        return a.GetRawText() == b.GetRawText();
+    }
+
+    private static JsonElement? ResolveFromPath(
+        string path, JsonElement request, IDictionary<string, JsonElement> ctx, FrameStack frames)
+    {
+        if (path.StartsWith("$ctx."))
+        {
+            if (ctx.Count == 0) return null;
+            return JsonPath.Resolve(DictToJsonElement(ctx), path).FirstOrDefault();
+        }
+        return JsonPath.Resolve(request, path, frames.ToList()).FirstOrDefault();
+    }
+
+    // ─── calc ──────────────────────────────────────────────────────────────
+
+    private static JsonElement? ExecuteCalc(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null) throw new InvalidOperationException($"calc '{node.Id}' has no config");
+        var cfg = ParseConfig<CalcConfig>(node, "calc");
+        if (string.IsNullOrEmpty(cfg.Expression)) throw new InvalidOperationException($"calc '{node.Id}' missing expression");
+
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var upstream = inEdges.Select(e => e.Source).Distinct()
+            .Where(s => run.NodeOutputs.ContainsKey(run.Key(s, frames)))
+            .Select(s => run.NodeOutputs[run.Key(s, frames)])
+            .ToList();
+        if (upstream.Count > 1) throw new InvalidOperationException($"calc '{node.Id}' has {upstream.Count} upstream outputs — exactly one required");
+
+        var upstreamEl = upstream.Count == 1 ? upstream[0] : (JsonElement?)null;
+
+        // Calc evaluator already supports upstream + ctx + request namespaces.
+        // Frame-rooted variables ($pax) are resolved here as a custom variable
+        // resolver: if the upstream/ctx/request lookup misses, try the frame stack.
+        var computed = CalcEvaluator.Evaluate(cfg.Expression, upstreamEl, run.Ctx, run.Request, frames.ToList());
+
+        if (string.IsNullOrEmpty(cfg.Target)) return computed;
+
+        var baseObj = upstreamEl is { ValueKind: JsonValueKind.Object } u
+            ? JsonNode.Parse(u.GetRawText())!.AsObject()
+            : new JsonObject();
+        baseObj[cfg.Target] = computed.HasValue ? JsonNode.Parse(computed.Value.GetRawText()) : null;
+        return JsonDocument.Parse(baseObj.ToJsonString()).RootElement;
+    }
+
+    // ─── reference (multi-row lookup) ──────────────────────────────────────
+
+    private async Task<(Verdict, JsonElement?)> ExecuteReferenceAsync(
+        RuleNode node, FrameStack frames, RunState run, Options options, CancellationToken ct)
+    {
+        if (node.Data.Config is null) throw new InvalidOperationException($"reference '{node.Id}' has no config");
+        if (options.ReferenceSetSource is null)
+            throw new InvalidOperationException($"reference '{node.Id}' has no ReferenceSetSource configured");
+
+        var cfg = ParseConfig<ReferenceConfig>(node, "reference");
+        if (string.IsNullOrEmpty(cfg.ReferenceId))
+            throw new InvalidOperationException($"reference '{node.Id}' missing referenceId");
+
+        var refSet = await options.ReferenceSetSource.GetByIdAsync(cfg.ReferenceId, ct)
+                     ?? throw new InvalidOperationException($"reference '{node.Id}': set '{cfg.ReferenceId}' not found");
+
+        var match = new Dictionary<string, JsonElement?>();
+        if (cfg.MatchOn is not null)
+        {
+            foreach (var kv in cfg.MatchOn)
+                match[kv.Key] = ResolveFromPath(kv.Value, run.Request, run.Ctx, frames);
+        }
+
+        var rows = new JsonArray();
+        foreach (var row in refSet.Rows)
+        {
+            var allMatch = true;
+            foreach (var (col, expected) in match)
+            {
+                if (!row.TryGetValue(col, out var actual)) { allMatch = false; break; }
+                if (!expected.HasValue || !RefValueEquals(actual, expected.Value)) { allMatch = false; break; }
+            }
+            if (!allMatch) continue;
+            var rowObj = new JsonObject();
+            foreach (var (k, v) in row) rowObj[k] = JsonNode.Parse(v.GetRawText());
+            rows.Add(rowObj);
+        }
+
+        return (Verdict.Pass, JsonDocument.Parse(rows.ToJsonString()).RootElement);
+    }
+
+    // ─── merge ─────────────────────────────────────────────────────────────
+
+    private static JsonElement? ExecuteMerge(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        var cfg = node.Data.Config is null
+            ? new MergeConfig(MergeMode.Collect)
+            : ParseConfig<MergeConfig>(node, "merge");
+
+        // Find which iterator this merge closes (innermost open at merge's location).
+        var iterId = graph.MergeClosesIterator.GetValueOrDefault(node.Id);
+        if (iterId is null) return JsonDocument.Parse("[]").RootElement;
+
+        var iterCount = run.GetIteratorCount(iterId, frames);
+        if (iterCount == 0) return cfg.Mode == MergeMode.Collect
+            ? JsonDocument.Parse("[]").RootElement
+            : (JsonElement?)null;
+
+        // Collect upstream outputs at frames + [each iter frame] for each iteration.
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var iterName = (graph.Nodes[iterId].Data.Config?.Deserialize<IteratorConfig>(ConfigJsonOptions))?.As ?? "iter";
+        var values = new List<JsonElement>();
+        for (var i = 0; i < iterCount; i++)
+        {
+            var iterFrame = new IterationFrame(iterName, default, i, iterCount);
+            var childFrames = frames.PushIndexOnly(iterFrame);
+            foreach (var src in inEdges.Select(e => e.Source).Distinct())
+            {
+                if (run.NodeOutputs.TryGetValue(run.Key(src, childFrames), out var val))
+                    values.Add(val);
+            }
+        }
+
+        return cfg.Mode switch
+        {
+            MergeMode.Collect => MakeArray(values),
+            MergeMode.Count   => MakeNumber(values.Count),
+            MergeMode.Sum     => MakeNumber(values.Sum(v => GetField(v, cfg.Field))),
+            MergeMode.Avg     => MakeNumber(values.Count == 0 ? 0 : values.Average(v => GetField(v, cfg.Field))),
+            MergeMode.Min     => values.Count == 0 ? MakeNumber(0) : MakeNumber(values.Min(v => GetField(v, cfg.Field))),
+            MergeMode.Max     => values.Count == 0 ? MakeNumber(0) : MakeNumber(values.Max(v => GetField(v, cfg.Field))),
+            MergeMode.First   => values.FirstOrDefault(),
+            MergeMode.Last    => values.LastOrDefault(),
+            _                 => MakeArray(values),
+        };
+    }
+
+    private static double GetField(JsonElement v, string? field)
+    {
+        if (string.IsNullOrEmpty(field) || field == "$" || field == "$.")
+        {
+            return v.ValueKind == JsonValueKind.Number ? v.GetDouble() : 0;
+        }
+        var resolved = JsonPath.Resolve(v, field).FirstOrDefault();
+        if (!resolved.HasValue) return 0;
+        return resolved.Value.ValueKind == JsonValueKind.Number ? resolved.Value.GetDouble() : 0;
+    }
+
+    private static JsonElement MakeArray(IEnumerable<JsonElement> values)
+    {
+        var arr = new JsonArray();
+        foreach (var v in values) arr.Add(JsonNode.Parse(v.GetRawText()));
+        return JsonDocument.Parse(arr.ToJsonString()).RootElement;
+    }
+
+    private static JsonElement MakeNumber(double d) =>
+        JsonDocument.Parse(d.ToString("R", CultureInfo.InvariantCulture)).RootElement;
+
+    // ─── output assembly ───────────────────────────────────────────────────
+
+    private static JsonElement? AssembleResult(RuleNode outputNode, GraphInfo graph, RunState run)
+    {
+        if (outputNode.Data.Config is { ValueKind: JsonValueKind.Object } cfg &&
+            cfg.TryGetProperty("result", out var literal))
+        {
+            return ResolveCtxPlaceholders(literal, run.Ctx, run.Request, FrameStack.Empty);
+        }
+
+        var inEdges = graph.Incoming.GetValueOrDefault(outputNode.Id) ?? new List<RuleEdge>();
+
+        // Collect upstream outputs at the output node's level (which is always
+        // empty frame stack — nothing iterates past the merge that closes it).
         var sources = inEdges.Select(e => e.Source).Distinct()
-            .Where(s => nodeOutputs.ContainsKey(s))
-            .Select(s => nodeOutputs[s])
+            .Where(s => run.NodeOutputs.ContainsKey(run.Key(s, FrameStack.Empty)))
+            .Select(s => run.NodeOutputs[run.Key(s, FrameStack.Empty)])
             .ToList();
 
         if (sources.Count == 0) return null;
-        if (sources.Count == 1) return ResolveCtxPlaceholders(sources[0], ctx);
+        if (sources.Count == 1) return ResolveCtxPlaceholders(sources[0], run.Ctx, run.Request, FrameStack.Empty);
 
         var merged = new JsonObject();
         foreach (var src in sources)
@@ -723,191 +894,354 @@ public sealed class RuleRunner
             foreach (var prop in src.EnumerateObject())
                 merged[prop.Name] = JsonNode.Parse(prop.Value.GetRawText());
         }
-        var assembled = JsonDocument.Parse(merged.ToJsonString()).RootElement;
-        return ResolveCtxPlaceholders(assembled, ctx);
+        return ResolveCtxPlaceholders(JsonDocument.Parse(merged.ToJsonString()).RootElement, run.Ctx, run.Request, FrameStack.Empty);
     }
 
-    // â”€â”€â”€ sub-rule call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── sub-rule call ─────────────────────────────────────────────────────
 
-    private enum SubRuleStatus { Ok, Default, Skipped, Failed }
+    private enum SubRuleStatus { Ok, OkArray, Default, Skipped, Failed }
 
-    private sealed record SubRuleResult(SubRuleStatus Status, Envelope? Envelope, string? RunId, string? Error);
+    private sealed record SubRuleResult(SubRuleStatus Status, Envelope? Envelope, string? RunId, string? Error, JsonElement? AccumulatedArray = null);
 
     private async Task<SubRuleResult> InvokeSubRuleAsync(
-        SubRuleCall call,
-        JsonElement parentRequest,
-        IDictionary<string, JsonElement> parentCtx,
-        Options options,
-        CancellationToken ct)
+        SubRuleCall call, JsonElement parentRequest, IDictionary<string, JsonElement> parentCtx,
+        FrameStack frames, Options options, CancellationToken ct)
     {
         try
         {
-            var subRule = await options.SubRuleSource!.GetByIdAsync(
-                call.RuleId,
-                ResolveVersion(call.PinnedVersion),
-                ct);
-
+            var subRule = await options.SubRuleSource!.GetByIdAsync(call.RuleId, ResolveVersion(call.PinnedVersion), ct);
             if (subRule is null)
-                throw new InvalidOperationException(
-                    $"subRuleCall: rule '{call.RuleId}' (version {call.PinnedVersion.GetRawText()}) not found");
+                throw new InvalidOperationException($"subRuleCall: rule '{call.RuleId}' not found");
 
-            var subRequest = BuildSubRequest(call.InputMapping, parentRequest, parentCtx);
-
-            // Sub-rule runs with no parent ctx and shares debug/clock with the parent.
-            var subEnvelope = await RunInternalAsync(
-                subRule,
-                subRequest,
-                options with { },
-                parentCtx: null,
-                ct);
-
-            var runId = $"srr-{call.RuleId}-{Guid.NewGuid():N}";
-
-            return subEnvelope.Decision switch
+            // No forEach — single invocation path
+            if (string.IsNullOrEmpty(call.ForEach))
             {
-                Decision.Apply => new SubRuleResult(SubRuleStatus.Ok, subEnvelope, runId, null),
-                // Skip and Error both mean "no result to map" for the host; the
-                // call's onError mode chooses the behavior. With onError=default
-                // the configured defaultValue is mapped instead.
-                Decision.Skip  => HandleSubRuleError(call, runId,
-                                    "sub-rule decided to skip (no result)"),
-                Decision.Error => HandleSubRuleError(call, runId,
-                                    subEnvelope.Trace?.LastOrDefault()?.Error
-                                    ?? "sub-rule errored without a trace"),
-                _ => HandleSubRuleError(call, runId, $"unknown sub-rule decision {subEnvelope.Decision}"),
-            };
+                var subRequest = BuildSubRequest(call.InputMapping, parentRequest, parentCtx, frames, asName: null, item: null, index: 0, count: 1);
+                var subEnvelope = await RunInternalAsync(subRule, subRequest, options with { }, ct);
+                var runId = $"srr-{call.RuleId}-{Guid.NewGuid():N}";
+                return subEnvelope.Decision switch
+                {
+                    Decision.Apply => new SubRuleResult(SubRuleStatus.Ok, subEnvelope, runId, null),
+                    Decision.Skip  => HandleSubRuleError(call, runId, "sub-rule decided to skip"),
+                    Decision.Error => HandleSubRuleError(call, runId, subEnvelope.Trace?.LastOrDefault()?.Error ?? "sub-rule errored"),
+                    _              => HandleSubRuleError(call, runId, $"unknown decision {subEnvelope.Decision}"),
+                };
+            }
+
+            // forEach path — fan out per element
+            var arrEl = JsonPath.Resolve(parentRequest, call.ForEach, frames.ToList()).FirstOrDefault();
+            var items = arrEl.HasValue && arrEl.Value.ValueKind == JsonValueKind.Array
+                ? arrEl.Value.EnumerateArray().ToList()
+                : new List<JsonElement>();
+            var asName = call.As ?? "item";
+
+            var accumulator = new JsonArray();
+            for (var i = 0; i < items.Count; i++)
+            {
+                var subReq = BuildSubRequest(call.InputMapping, parentRequest, parentCtx, frames, asName, items[i], i, items.Count);
+                var subEnv = await RunInternalAsync(subRule, subReq, options with { }, ct);
+                if (subEnv.Decision == Decision.Apply)
+                {
+                    // Build per-iteration mapped object
+                    var perIter = MapToObject(call.OutputMapping, subEnv);
+                    if (perIter is not null) accumulator.Add(JsonNode.Parse(perIter.Value.GetRawText()));
+                }
+                else if (call.OnError == SubRuleErrorMode.Default && call.DefaultValue.HasValue)
+                {
+                    var fakeEnv = new Envelope("(default)", 0, Decision.Apply, "", call.DefaultValue, null, null);
+                    var perIter = MapToObject(call.OutputMapping, fakeEnv);
+                    if (perIter is not null) accumulator.Add(JsonNode.Parse(perIter.Value.GetRawText()));
+                }
+                else if (call.OnError == SubRuleErrorMode.Fail)
+                {
+                    return HandleSubRuleError(call, null, $"sub-rule iter {i} failed");
+                }
+                // Skip onError — just don't append
+            }
+            var arr = JsonDocument.Parse(accumulator.ToJsonString()).RootElement;
+            return new SubRuleResult(SubRuleStatus.OkArray, null, $"srr-{call.RuleId}-{Guid.NewGuid():N}", null, arr);
         }
         catch (Exception e)
         {
-            return HandleSubRuleError(call, runId: null, e.Message);
+            return HandleSubRuleError(call, null, e.Message);
         }
     }
 
-    private static SubRuleResult HandleSubRuleError(SubRuleCall call, string? runId, string message)
+    private static JsonElement? MapToObject(IReadOnlyDictionary<string, string> outputMapping, Envelope env)
     {
-        return call.OnError switch
+        var envelopeRoot = JsonSerializer.SerializeToElement(env, AeroJson.Options);
+        var obj = new JsonObject();
+        var any = false;
+        foreach (var kv in outputMapping)
+        {
+            if (kv.Key.StartsWith("ctx.")) continue; // ctx writes don't fit the per-iter array model
+            var rooted = kv.Value.StartsWith("$.") || kv.Value.StartsWith("$") ? kv.Value : "$." + kv.Value;
+            var resolved = JsonPath.Resolve(envelopeRoot, rooted).FirstOrDefault();
+            if (resolved.HasValue) { obj[kv.Key] = JsonNode.Parse(resolved.Value.GetRawText()); any = true; }
+        }
+        return any ? JsonDocument.Parse(obj.ToJsonString()).RootElement : (JsonElement?)null;
+    }
+
+    private static SubRuleResult HandleSubRuleError(SubRuleCall call, string? runId, string message) =>
+        call.OnError switch
         {
             SubRuleErrorMode.Skip    => new SubRuleResult(SubRuleStatus.Skipped, null, runId, message),
             SubRuleErrorMode.Default => new SubRuleResult(SubRuleStatus.Default, null, runId, message),
             _                        => new SubRuleResult(SubRuleStatus.Failed, null, runId, message),
         };
-    }
 
     private static int? ResolveVersion(JsonElement pinned) =>
         pinned.ValueKind == JsonValueKind.Number && pinned.TryGetInt32(out var v) ? v : null;
 
-    /// <summary>
-    /// Build the sub-rule's request from the parent. Each entry in
-    /// <c>inputMapping</c> is <c>parentJsonPath â†’ subRuleInputKey</c>: we
-    /// resolve the path against the parent (request first, falling back to
-    /// <c>$ctx.</c>-prefixed paths against parent ctx) and assign the value
-    /// to the named key in a new object.
-    /// </summary>
     private static JsonElement BuildSubRequest(
         IReadOnlyDictionary<string, string> inputMapping,
-        JsonElement parentRequest,
-        IDictionary<string, JsonElement> parentCtx)
+        JsonElement parentRequest, IDictionary<string, JsonElement> parentCtx,
+        FrameStack frames, string? asName, JsonElement? item, int index, int count)
     {
         var obj = new JsonObject();
         foreach (var kv in inputMapping)
         {
-            var key = kv.Key;
-            var path = kv.Value;
+            var key = kv.Key; var path = kv.Value;
             JsonElement? resolved;
-            if (path.StartsWith("$ctx."))
-            {
-                var ctxEl = parentCtx.Count == 0 ? (JsonElement?)null : DictToJsonElement(parentCtx);
-                resolved = ctxEl.HasValue ? JsonPath.Resolve(ctxEl, path).FirstOrDefault() : null;
-            }
+
+            if (asName is not null && item.HasValue && (path == "$" + asName))
+                resolved = item;
+            else if (asName is not null && path == "$index")
+                resolved = JsonDocument.Parse(index.ToString()).RootElement;
+            else if (asName is not null && path == "$count")
+                resolved = JsonDocument.Parse(count.ToString()).RootElement;
+            else if (path.StartsWith("$ctx."))
+                resolved = parentCtx.Count == 0 ? null : JsonPath.Resolve(DictToJsonElement(parentCtx), path).FirstOrDefault();
             else
             {
-                resolved = JsonPath.Resolve(parentRequest, path).FirstOrDefault();
+                // Build a one-shot frames list that includes the current iteration if any
+                var liveFrames = frames.ToList();
+                if (asName is not null && item.HasValue)
+                    liveFrames = liveFrames.Append(new IterationFrame(asName, item.Value, index, count)).ToList();
+                resolved = JsonPath.Resolve(parentRequest, path, liveFrames).FirstOrDefault();
             }
             obj[key] = resolved.HasValue ? JsonNode.Parse(resolved.Value.GetRawText()) : null;
         }
         return JsonDocument.Parse(obj.ToJsonString()).RootElement;
     }
 
-    /// <summary>
-    /// Apply <c>outputMapping</c>: each entry is <c>parentTarget â†’ subRulePath</c>.
-    /// Targets prefixed with <c>ctx.</c> write into the parent's execution
-    /// context; others write into the host node's output object.
-    /// </summary>
     private static void ApplyOutputMapping(
-        IReadOnlyDictionary<string, string> outputMapping,
-        Envelope subEnvelope,
-        IDictionary<string, JsonElement> ctx,
-        Dictionary<string, JsonElement> nodeOutputs,
-        string hostNodeId)
+        IReadOnlyDictionary<string, string> outputMapping, Envelope subEnvelope,
+        IDictionary<string, JsonElement> ctx, Dictionary<string, JsonElement> nodeOutputs,
+        string hostKey, FrameStack frames)
     {
-        // Assemble a virtual root over the sub-rule envelope so paths like
-        // "result.bonusPieces" resolve naturally.
         var envelopeRoot = JsonSerializer.SerializeToElement(subEnvelope, AeroJson.Options);
-
-        JsonObject? hostOutputAccum = null;
-
+        JsonObject? hostAccum = null;
         foreach (var kv in outputMapping)
         {
-            var target = kv.Key;
-            var path = kv.Value;
-            // Allow shorthand: "result" or "result.X" without a leading $.
-            var rooted = path.StartsWith("$.") || path.StartsWith("$")
-                ? path
-                : "$." + path;
+            var target = kv.Key; var path = kv.Value;
+            var rooted = path.StartsWith("$.") || path.StartsWith("$") ? path : "$." + path;
             var resolved = JsonPath.Resolve(envelopeRoot, rooted).FirstOrDefault();
             if (!resolved.HasValue) continue;
 
             if (target.StartsWith("ctx."))
-            {
                 ctx[target.Substring(4)] = resolved.Value.Clone();
+            else
+            {
+                hostAccum ??= new JsonObject();
+                hostAccum[target] = JsonNode.Parse(resolved.Value.GetRawText());
+            }
+        }
+        if (hostAccum is not null) nodeOutputs[hostKey] = JsonDocument.Parse(hostAccum.ToJsonString()).RootElement;
+    }
+
+    private static void ApplyDefault(SubRuleCall call, IDictionary<string, JsonElement> ctx, Dictionary<string, JsonElement> nodeOutputs, string hostKey, FrameStack frames)
+    {
+        if (!call.DefaultValue.HasValue) return;
+        var fakeEnv = new Envelope("(default)", 0, Decision.Apply, "", call.DefaultValue, null, null);
+        ApplyOutputMapping(call.OutputMapping, fakeEnv, ctx, nodeOutputs, hostKey, frames);
+    }
+
+    // ─── graph analysis ────────────────────────────────────────────────────
+
+    private sealed record GraphInfo(
+        IReadOnlyDictionary<string, RuleNode> Nodes,
+        IReadOnlyDictionary<string, List<RuleEdge>> Outgoing,
+        IReadOnlyDictionary<string, List<RuleEdge>> Incoming,
+        IReadOnlyDictionary<string, string> MergeClosesIterator,
+        IReadOnlyDictionary<string, string> IteratorClosingMerge);
+
+    private static GraphInfo AnalyzeGraph(Rule rule)
+    {
+        var nodes = rule.Nodes.ToDictionary(n => n.Id);
+        var outgoing = rule.Edges.GroupBy(e => e.Source).ToDictionary(g => g.Key, g => g.ToList());
+        var incoming = rule.Edges.GroupBy(e => e.Target).ToDictionary(g => g.Key, g => g.ToList());
+
+        // DFS from the input node, maintaining a stack of open iterators.
+        var input = rule.Nodes.Single(n => n.Data.Category == NodeCategory.Input);
+        var mergeMap = new Dictionary<string, string>();
+        var visited = new HashSet<string>();
+        var stack = new Stack<string>();
+        DFS(input.Id);
+        // Reverse mapping for iterator → its closing merge (used to handle
+        // empty iterations: the iterator fires zero bodies but still needs to
+        // "close" via the merge, which then emits an empty array / 0 / etc.).
+        var iterClose = mergeMap.ToDictionary(kv => kv.Value, kv => kv.Key);
+        return new GraphInfo(nodes, outgoing, incoming, mergeMap, iterClose);
+
+        void DFS(string nodeId)
+        {
+            if (visited.Contains(nodeId)) return;
+            visited.Add(nodeId);
+            var node = nodes[nodeId];
+
+            if (node.Data.Category == NodeCategory.Iterator)
+            {
+                stack.Push(nodeId);
+                if (outgoing.TryGetValue(nodeId, out var outs))
+                    foreach (var e in outs) DFS(e.Target);
+                // Pop happens implicitly: when we hit the merge, we record + pop
+            }
+            else if (node.Data.Category == NodeCategory.Merge)
+            {
+                if (stack.Count > 0)
+                {
+                    mergeMap[nodeId] = stack.Pop();
+                }
+                if (outgoing.TryGetValue(nodeId, out var outs))
+                    foreach (var e in outs) DFS(e.Target);
             }
             else
             {
-                hostOutputAccum ??= new JsonObject();
-                hostOutputAccum[target] = JsonNode.Parse(resolved.Value.GetRawText());
+                if (outgoing.TryGetValue(nodeId, out var outs))
+                    foreach (var e in outs) DFS(e.Target);
             }
         }
-
-        if (hostOutputAccum is not null)
-            nodeOutputs[hostNodeId] = JsonDocument.Parse(hostOutputAccum.ToJsonString()).RootElement;
     }
 
-    private static void ApplyDefault(
-        SubRuleCall call,
-        IDictionary<string, JsonElement> ctx,
-        Dictionary<string, JsonElement> nodeOutputs,
-        string hostNodeId)
+    // ─── run state ─────────────────────────────────────────────────────────
+
+    private sealed class RunState
     {
-        if (!call.DefaultValue.HasValue) return;
-        // Treat defaultValue as if it were the sub-rule's result.
-        var fakeEnvelope = new Envelope("(default)", 0, Decision.Apply, "", call.DefaultValue, null, null);
-        ApplyOutputMapping(call.OutputMapping, fakeEnvelope, ctx, nodeOutputs, hostNodeId);
+        public GraphInfo Graph { get; }
+        public JsonElement Request { get; }
+        public Options Options { get; }
+        public List<TraceEntry>? Trace { get; }
+        public Dictionary<string, JsonElement> Ctx { get; } = new();
+
+        public Queue<(string nodeId, FrameStack frames)> Queue { get; } = new();
+        public HashSet<string> Activated { get; } = new();
+        public HashSet<string> Fired { get; } = new();
+        public Dictionary<string, JsonElement> NodeOutputs { get; } = new();
+        public Dictionary<string, Verdict> Verdicts { get; } = new();
+        public Dictionary<string, int> IteratorCounts { get; } = new();
+
+        public RunState(GraphInfo graph, JsonElement request, Options options, List<TraceEntry>? trace)
+        {
+            Graph = graph; Request = request; Options = options; Trace = trace;
+        }
+
+        public string Key(string nodeId, FrameStack frames) => $"{nodeId}|{frames.Key}";
+
+        public void Activate(string nodeId, FrameStack frames)
+        {
+            var k = Key(nodeId, frames);
+            if (Activated.Add(k)) Queue.Enqueue((nodeId, frames));
+        }
+
+        public void RecordIteratorCount(string iterId, FrameStack frames, int count)
+        {
+            IteratorCounts[Key(iterId, frames)] = count;
+        }
+
+        public int GetIteratorCount(string iterId, FrameStack frames) =>
+            IteratorCounts.TryGetValue(Key(iterId, frames), out var c) ? c : 0;
+
+        public bool AllInnerIterationsCompleteFor(string mergeId, FrameStack frames, GraphInfo graph)
+        {
+            if (!graph.MergeClosesIterator.TryGetValue(mergeId, out var iterId)) return true;
+            var expected = GetIteratorCount(iterId, frames);
+            if (expected == 0)
+            {
+                // Iterator may not have fired yet at this frame stack
+                return Fired.Contains(Key(iterId, frames));
+            }
+
+            // Each upstream of the merge must have fired at frames + [iter-frame i] for every i
+            var inEdges = graph.Incoming.GetValueOrDefault(mergeId) ?? new List<RuleEdge>();
+            var iterName = (graph.Nodes[iterId].Data.Config?.Deserialize<IteratorConfig>(ConfigJsonOptions))?.As ?? "iter";
+            for (var i = 0; i < expected; i++)
+            {
+                var iterFrame = new IterationFrame(iterName, default, i, expected);
+                var childFrames = frames.PushIndexOnly(iterFrame);
+                foreach (var src in inEdges.Select(e => e.Source).Distinct())
+                {
+                    if (graph.Nodes[src].Data.Category == NodeCategory.Iterator) continue;
+                    var srcKey = Key(src, childFrames);
+                    if (!Activated.Contains(srcKey)) continue;
+                    if (!Fired.Contains(srcKey)) return false;
+                }
+            }
+            return true;
+        }
     }
 
-    // â”€â”€â”€ helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ─── frame stack ───────────────────────────────────────────────────────
+
+    private sealed class FrameStack
+    {
+        public static readonly FrameStack Empty = new(ImmutableList<IterationFrame>.Empty);
+
+        private readonly ImmutableList<IterationFrame> _frames;
+        public string Key { get; }
+
+        public FrameStack(ImmutableList<IterationFrame> frames)
+        {
+            _frames = frames;
+            Key = string.Join("|", frames.Select(f => $"{f.Name}={f.Index}"));
+        }
+
+        public int Count => _frames.Count;
+        public IReadOnlyList<IterationFrame> ToList() => _frames;
+
+        public FrameStack Push(IterationFrame f) => new(_frames.Add(f));
+
+        /// <summary>
+        /// Variant of Push that uses only (name, index) for identity — the item
+        /// itself is irrelevant for keying. Used by the merge to look up siblings.
+        /// </summary>
+        public FrameStack PushIndexOnly(IterationFrame f) => new(_frames.Add(f));
+
+        public FrameStack Pop() =>
+            _frames.Count == 0 ? Empty : new(_frames.RemoveAt(_frames.Count - 1));
+    }
+
+    // ─── helpers ───────────────────────────────────────────────────────────
+
+    private static T ParseConfig<T>(RuleNode node, string label) where T : class
+    {
+        try
+        {
+            return node.Data.Config!.Value.Deserialize<T>(ConfigJsonOptions)!;
+        }
+        catch (JsonException e)
+        {
+            throw new InvalidOperationException($"{label} '{node.Id}' config parse failed: {e.Message}", e);
+        }
+    }
 
     private static JsonElement DictToJsonElement(IDictionary<string, JsonElement> dict)
     {
         var obj = new JsonObject();
-        foreach (var kv in dict)
-            obj[kv.Key] = JsonNode.Parse(kv.Value.GetRawText());
+        foreach (var kv in dict) obj[kv.Key] = JsonNode.Parse(kv.Value.GetRawText());
         return JsonDocument.Parse(obj.ToJsonString()).RootElement;
     }
 
-    private static bool JsonElementEquals(JsonElement a, JsonElement b) =>
-        a.GetRawText() == b.GetRawText();
+    private static bool JsonElementEquals(JsonElement a, JsonElement b) => a.GetRawText() == b.GetRawText();
 
     private static void EnsureStructuredFilterShape(string nodeId, JsonElement config)
     {
         if (config.ValueKind != JsonValueKind.Object)
             throw new InvalidOperationException($"filter node '{nodeId}' config is not an object");
-
-        var hasSource = config.TryGetProperty("source", out _);
-        var hasCompare = config.TryGetProperty("compare", out _);
-        var hasArraySelector = config.TryGetProperty("arraySelector", out _);
-        var hasOnMissing = config.TryGetProperty("onMissing", out _);
-
-        if (!hasSource || !hasCompare || !hasArraySelector || !hasOnMissing)
+        if (!config.TryGetProperty("source", out _) ||
+            !config.TryGetProperty("compare", out _) ||
+            !config.TryGetProperty("arraySelector", out _) ||
+            !config.TryGetProperty("onMissing", out _))
             throw new InvalidOperationException(
                 $"filter node '{nodeId}' uses a legacy/flat config shape. " +
                 "Engine requires the structured shape with source/compare/arraySelector/onMissing.");
@@ -923,8 +1257,7 @@ public sealed class RuleRunner
             if (!nodes.ContainsKey(e.Target))
                 throw new InvalidOperationException($"edge {e.Id} has unknown target '{e.Target}'");
         }
-        if (HasCycle(rule))
-            throw new InvalidOperationException($"rule '{rule.Id}' contains a cycle");
+        if (HasCycle(rule)) throw new InvalidOperationException($"rule '{rule.Id}' contains a cycle");
         if (rule.Nodes.Count(n => n.Data.Category == NodeCategory.Input) != 1)
             throw new InvalidOperationException($"rule '{rule.Id}' must have exactly one input node");
         if (rule.Nodes.Count(n => n.Data.Category == NodeCategory.Output) != 1)
@@ -933,27 +1266,21 @@ public sealed class RuleRunner
 
     private static bool HasCycle(Rule rule)
     {
-        var graph = rule.Edges.GroupBy(e => e.Source)
-            .ToDictionary(g => g.Key, g => g.Select(e => e.Target).ToList());
+        var graph = rule.Edges.GroupBy(e => e.Source).ToDictionary(g => g.Key, g => g.Select(e => e.Target).ToList());
         var visiting = new HashSet<string>();
         var done = new HashSet<string>();
-
         bool Visit(string id)
         {
             if (done.Contains(id)) return false;
             if (!visiting.Add(id)) return true;
-            if (graph.TryGetValue(id, out var targets))
-                foreach (var t in targets)
-                    if (Visit(t)) return true;
-            visiting.Remove(id);
-            done.Add(id);
+            if (graph.TryGetValue(id, out var ts)) foreach (var t in ts) if (Visit(t)) return true;
+            visiting.Remove(id); done.Add(id);
             return false;
         }
         return rule.Nodes.Any(n => Visit(n.Id));
     }
 
-    private static string IsoUtc(DateTimeOffset t) =>
-        t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+    private static string IsoUtc(DateTimeOffset t) => t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
 
     private static TraceOutcome ToOutcome(Verdict v) => v switch
     {
@@ -963,3 +1290,8 @@ public sealed class RuleRunner
         _            => TraceOutcome.Error,
     };
 }
+
+// Reference-node config — siblings of MutatorConfig.LookupSpec.
+public sealed record ReferenceConfig(
+    string ReferenceId,
+    IReadOnlyDictionary<string, string>? MatchOn = null);

@@ -1,0 +1,22 @@
+{
+  "pnr": "SEAT001",
+  "journeys": [
+    {
+      "id": "j1",
+      "segments": [
+        { "id": "s1a", "flightNo": "EK1", "cabin": "Y" },
+        { "id": "s1b", "flightNo": "EK2", "cabin": "Y" }
+      ]
+    },
+    {
+      "id": "j2",
+      "segments": [
+        { "id": "s2a", "flightNo": "EK3", "cabin": "J" }
+      ]
+    }
+  ],
+  "pax": [
+    { "id": "p1", "name": "Alice" },
+    { "id": "p2", "name": "Bob" }
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "id": "rule-pnr-taxes",
+  "name": "PNR tax engine · per-pax itemisation",
+  "description": "For each passenger, look up their applicable GB1 tax rate by origin and age category. Emit a flat array of tax lines, one per pax.",
+  "tags": ["tax", "v8", "iteration"],
+  "category": "Tax",
+  "endpoint": "/v1/tax/pnr",
+  "method": "POST",
+  "status": "published",
+  "currentVersion": 1,
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pnr":  { "type": "string" },
+      "orig": { "type": "string" },
+      "pax":  { "type": "array" }
+    },
+    "required": ["orig", "pax"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "ruleId":      { "type": "string" },
+      "ruleVersion": { "type": "integer" },
+      "decision":    { "type": "string" },
+      "evaluatedAt": { "type": "string" },
+      "result":      { "type": "array" },
+      "trace":       { "type": "array" }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1-input", "type": "input",
+      "position": { "x": 40, "y": 200 },
+      "data": { "label": "Booking", "category": "input" }
+    },
+    {
+      "id": "n2-foreach", "type": "iterator",
+      "position": { "x": 260, "y": 200 },
+      "data": {
+        "label": "For each passenger", "category": "iterator",
+        "config": { "source": "$.pax", "as": "pax" }
+      }
+    },
+    {
+      "id": "n3-base", "type": "constant",
+      "position": { "x": 480, "y": 200 },
+      "data": {
+        "label": "Tax-line shell", "category": "constant",
+        "config": {
+          "value": { "code": "GB1", "amount": 0, "currency": "GBP" }
+        }
+      }
+    },
+    {
+      "id": "n4-paxid", "type": "mutator",
+      "position": { "x": 700, "y": 200 },
+      "data": {
+        "label": "Set paxId", "category": "mutator",
+        "config": { "target": "paxId", "from": "$pax.id" }
+      }
+    },
+    {
+      "id": "n5-amount", "type": "mutator",
+      "position": { "x": 920, "y": 200 },
+      "data": {
+        "label": "Lookup GB1 amount", "category": "mutator",
+        "config": {
+          "target": "amount",
+          "lookup": {
+            "referenceId": "ref-tax-rates",
+            "valueColumn": "amount",
+            "matchOn": {
+              "origin":      "$.orig",
+              "ageCategory": "$pax.ageCategory",
+              "code":        "$.taxCode"
+            }
+          },
+          "onMissing": "leave"
+        }
+      }
+    },
+    {
+      "id": "n6-merge", "type": "merge",
+      "position": { "x": 1180, "y": 200 },
+      "data": {
+        "label": "Collect lines", "category": "merge",
+        "config": { "mode": "collect" }
+      }
+    },
+    {
+      "id": "n7-output", "type": "output",
+      "position": { "x": 1420, "y": 200 },
+      "data": { "label": "Result", "category": "output" }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "source": "n1-input",   "target": "n2-foreach", "branch": "default" },
+    { "id": "e2", "source": "n2-foreach", "target": "n3-base",    "branch": "pass"    },
+    { "id": "e3", "source": "n3-base",    "target": "n4-paxid",   "branch": "default" },
+    { "id": "e4", "source": "n4-paxid",   "target": "n5-amount",  "branch": "default" },
+    { "id": "e5", "source": "n5-amount",  "target": "n6-merge",   "branch": "default" },
+    { "id": "e6", "source": "n6-merge",   "target": "n7-output",  "branch": "default" }
+  ],
+  "updatedAt": "2026-04-27T18:00:00.000Z",
+  "updatedBy": "slice-4-bootstrap"
+}

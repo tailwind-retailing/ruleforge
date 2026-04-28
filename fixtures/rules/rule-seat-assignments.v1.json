@@ -1,0 +1,150 @@
+{
+  "id": "rule-seat-assignments",
+  "name": "Seat assignments · journey × segment × pax",
+  "description": "Three-deep iteration: for each journey, for each segment, for each passenger, emit a seat-eligibility line. Result is a flat array stamped with all three iteration variables.",
+  "tags": ["seats", "v9", "nested-iteration"],
+  "category": "Ancillary",
+  "endpoint": "/v1/seats/assignments",
+  "method": "POST",
+  "status": "published",
+  "currentVersion": 1,
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "pnr":      { "type": "string" },
+      "journeys": { "type": "array" },
+      "pax":      { "type": "array" }
+    },
+    "required": ["journeys", "pax"]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "ruleId":      { "type": "string" },
+      "ruleVersion": { "type": "integer" },
+      "decision":    { "type": "string" },
+      "evaluatedAt": { "type": "string" },
+      "result":      { "type": "array" },
+      "trace":       { "type": "array" }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1-input",  "type": "input",
+      "position": { "x": 40, "y": 200 },
+      "data": { "label": "Booking", "category": "input" }
+    },
+
+    {
+      "id": "n2-journeys",  "type": "iterator",
+      "position": { "x": 240, "y": 200 },
+      "data": {
+        "label": "For each journey", "category": "iterator",
+        "config": { "source": "$.journeys", "as": "journey" }
+      }
+    },
+    {
+      "id": "n3-segments", "type": "iterator",
+      "position": { "x": 440, "y": 200 },
+      "data": {
+        "label": "For each segment", "category": "iterator",
+        "config": { "source": "$journey.segments", "as": "segment" }
+      }
+    },
+    {
+      "id": "n4-pax",      "type": "iterator",
+      "position": { "x": 640, "y": 200 },
+      "data": {
+        "label": "For each passenger", "category": "iterator",
+        "config": { "source": "$.pax", "as": "pax" }
+      }
+    },
+
+    {
+      "id": "n5-base", "type": "constant",
+      "position": { "x": 840, "y": 200 },
+      "data": {
+        "label": "Seat-line shell", "category": "constant",
+        "config": { "value": { "seat": "auto", "class": "" } }
+      }
+    },
+    {
+      "id": "n6-set-journey", "type": "mutator",
+      "position": { "x": 1040, "y": 200 },
+      "data": {
+        "label": "Set journeyId", "category": "mutator",
+        "config": { "target": "journeyId", "from": "$journey.id" }
+      }
+    },
+    {
+      "id": "n7-set-segment", "type": "mutator",
+      "position": { "x": 1240, "y": 200 },
+      "data": {
+        "label": "Set segmentId", "category": "mutator",
+        "config": { "target": "segmentId", "from": "$segment.id" }
+      }
+    },
+    {
+      "id": "n8-set-pax", "type": "mutator",
+      "position": { "x": 1440, "y": 200 },
+      "data": {
+        "label": "Set paxId", "category": "mutator",
+        "config": { "target": "paxId", "from": "$pax.id" }
+      }
+    },
+    {
+      "id": "n9-set-cabin", "type": "mutator",
+      "position": { "x": 1640, "y": 200 },
+      "data": {
+        "label": "Set cabin name", "category": "mutator",
+        "config": {
+          "target": "class",
+          "lookup": {
+            "referenceId": "ref-cabin-class",
+            "valueColumn": "name",
+            "matchOn": { "code": "$segment.cabin" }
+          },
+          "onMissing": "leave"
+        }
+      }
+    },
+
+    {
+      "id": "n10-merge-pax",     "type": "merge",
+      "position": { "x": 1840, "y": 200 },
+      "data": { "label": "Collect pax", "category": "merge", "config": { "mode": "collect" } }
+    },
+    {
+      "id": "n11-merge-segments", "type": "merge",
+      "position": { "x": 2040, "y": 200 },
+      "data": { "label": "Collect segments", "category": "merge", "config": { "mode": "collect" } }
+    },
+    {
+      "id": "n12-merge-journeys", "type": "merge",
+      "position": { "x": 2240, "y": 200 },
+      "data": { "label": "Collect journeys", "category": "merge", "config": { "mode": "collect" } }
+    },
+
+    {
+      "id": "n13-output", "type": "output",
+      "position": { "x": 2440, "y": 200 },
+      "data": { "label": "Seat assignments", "category": "output" }
+    }
+  ],
+  "edges": [
+    { "id": "e1",  "source": "n1-input",   "target": "n2-journeys",       "branch": "default" },
+    { "id": "e2",  "source": "n2-journeys","target": "n3-segments",       "branch": "pass"    },
+    { "id": "e3",  "source": "n3-segments","target": "n4-pax",            "branch": "pass"    },
+    { "id": "e4",  "source": "n4-pax",     "target": "n5-base",           "branch": "pass"    },
+    { "id": "e5",  "source": "n5-base",    "target": "n6-set-journey",    "branch": "default" },
+    { "id": "e6",  "source": "n6-set-journey", "target": "n7-set-segment","branch": "default" },
+    { "id": "e7",  "source": "n7-set-segment","target": "n8-set-pax",     "branch": "default" },
+    { "id": "e8",  "source": "n8-set-pax",     "target": "n9-set-cabin",  "branch": "default" },
+    { "id": "e9",  "source": "n9-set-cabin",   "target": "n10-merge-pax", "branch": "default" },
+    { "id": "e10", "source": "n10-merge-pax",     "target": "n11-merge-segments", "branch": "default" },
+    { "id": "e11", "source": "n11-merge-segments","target": "n12-merge-journeys", "branch": "default" },
+    { "id": "e12", "source": "n12-merge-journeys","target": "n13-output",         "branch": "default" }
+  ],
+  "updatedAt": "2026-04-27T18:30:00.000Z",
+  "updatedBy": "slice-4-bootstrap"
+}

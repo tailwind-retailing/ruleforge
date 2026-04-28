@@ -1,6 +1,7 @@
 ﻿using System.Globalization;
 using System.Text.Json;
 using NCalc;
+using RuleForge.Core.Models;
 
 namespace RuleForge.Core.Evaluators;
 
@@ -16,7 +17,15 @@ public static class CalcEvaluator
         string expression,
         JsonElement? upstream,
         IDictionary<string, JsonElement> ctx,
-        JsonElement request)
+        JsonElement request) =>
+        Evaluate(expression, upstream, ctx, request, frames: null);
+
+    public static JsonElement? Evaluate(
+        string expression,
+        JsonElement? upstream,
+        IDictionary<string, JsonElement> ctx,
+        JsonElement request,
+        IReadOnlyList<IterationFrame>? frames)
     {
         // Default options: case-sensitive operators / functions. We do our own
         // case-insensitive variable resolution against the JSON inputs below.
@@ -24,7 +33,7 @@ public static class CalcEvaluator
 
         expr.EvaluateParameter += (name, args) =>
         {
-            if (TryResolveVariable(name, upstream, ctx, request, out var resolved))
+            if (TryResolveVariable(name, upstream, ctx, request, frames, out var resolved))
                 args.Result = resolved;
         };
 
@@ -47,12 +56,36 @@ public static class CalcEvaluator
         JsonElement? upstream,
         IDictionary<string, JsonElement> ctx,
         JsonElement request,
+        IReadOnlyList<IterationFrame>? frames,
         out object? value)
     {
         // Upstream fields take priority.
         if (upstream is { ValueKind: JsonValueKind.Object } u &&
             TryReadProperty(u, name, out value))
             return true;
+
+        // Iteration frames (innermost first): bare name → frame.Item if it's a
+        // primitive; <name>Index / <name>Count → integer.
+        if (frames is { Count: > 0 })
+        {
+            for (var i = frames.Count - 1; i >= 0; i--)
+            {
+                var f = frames[i];
+                if (string.Equals(name, f.Name, StringComparison.Ordinal))
+                {
+                    if (TryUnwrap(f.Item, out value)) return true;
+                    break;
+                }
+                if (string.Equals(name, f.Name + "Index", StringComparison.Ordinal))
+                {
+                    value = (long)f.Index; return true;
+                }
+                if (string.Equals(name, f.Name + "Count", StringComparison.Ordinal))
+                {
+                    value = (long)f.Count; return true;
+                }
+            }
+        }
 
         // Then ctx.
         if (ctx.TryGetValue(name, out var ctxEl) && TryUnwrap(ctxEl, out value))

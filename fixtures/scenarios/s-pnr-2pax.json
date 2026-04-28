@@ -1,0 +1,9 @@
+{
+  "pnr": "TAX001",
+  "orig": "LHR",
+  "taxCode": "GB1",
+  "pax": [
+    { "id": "p1", "ageCategory": "ADT" },
+    { "id": "p2", "ageCategory": "CHD" }
+  ]
+}

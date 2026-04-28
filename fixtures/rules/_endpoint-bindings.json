@@ -1,4 +1,6 @@
 {
   "POST /v1/ancillary/bag-policy":  "rule-bag-policy@7",
-  "POST /v1/ancillary/tier-bonus":  "rule-tier-bonus@1"
+  "POST /v1/ancillary/tier-bonus":  "rule-tier-bonus@1",
+  "POST /v1/tax/pnr":               "rule-pnr-taxes@1",
+  "POST /v1/seats/assignments":     "rule-seat-assignments@1"
 }

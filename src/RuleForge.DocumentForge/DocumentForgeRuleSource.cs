@@ -26,11 +26,33 @@ public sealed class DocumentForgeRuleSource : IRuleSource
     private readonly ConcurrentDictionary<(string ruleId, int version), Rule> _versionCache = new();
     private (DateTimeOffset loadedAt, IReadOnlyDictionary<string, int> bindings)? _envCache;
     private readonly SemaphoreSlim _envLock = new(1, 1);
+    private DateTimeOffset _lastRefreshedAt = DateTimeOffset.UtcNow;
+
+    /// <summary>When the in-memory caches were last fully invalidated.</summary>
+    public DateTimeOffset LastRefreshedAt => _lastRefreshedAt;
+
+    /// <summary>Number of cached <c>(ruleId, version)</c> snapshots.</summary>
+    public int CachedSnapshotCount => _versionCache.Count;
 
     public DocumentForgeRuleSource(DfClient client, string envName)
     {
         _client = client;
         _envName = envName;
+    }
+
+    public async Task RefreshAsync(CancellationToken ct = default)
+    {
+        await _envLock.WaitAsync(ct);
+        try
+        {
+            _versionCache.Clear();
+            _envCache = null;
+            _lastRefreshedAt = DateTimeOffset.UtcNow;
+        }
+        finally
+        {
+            _envLock.Release();
+        }
     }
 
     public async Task<Rule?> GetByEndpointAsync(string endpoint, HttpMethodKind method, CancellationToken ct = default)

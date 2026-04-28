@@ -10,6 +10,11 @@ public interface IReferenceSetSource
     /// are immutable per version.
     /// </summary>
     Task<ReferenceSet?> GetByIdAsync(string referenceId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Drop any cached reference sets. Default no-op.
+    /// </summary>
+    Task RefreshAsync(CancellationToken ct = default) => Task.CompletedTask;
 }
 
 public sealed record ReferenceSet(

@@ -171,12 +171,19 @@ This hits the per-pax tax fixture (`rule-pnr-taxes@1`) shipped in the image.
 Substitute your own published rules once the AERO admin team has authored
 them and bound them to your environment.
 
-**Operational note**
+**Admin endpoints** (auth-gated by `RULEFORGE_API_KEY` when set)
 
-The auto-router enumerates environment bindings **once at boot**. After
-publishing a new rule binding, trigger a redeploy in Render (or push to
-main — autoDeploy is on) so the new endpoint registers. We'll add a
-`/admin/reload-bindings` endpoint in a future slice to avoid the restart.
+| Endpoint | What it does |
+|---|---|
+| `GET  /health`          | Liveness probe. Always open, returns `{ok: true}` |
+| `GET  /admin/bindings`  | Currently-bound endpoints + cache stats (`{bindings, registeredAtBoot, cache: {ruleSnapshots, refSets, refreshedAt}}`) |
+| `POST /admin/refresh`   | Drop the source caches. Useful after a rule publish so the next request reads the new version. NEW endpoints still need a redeploy. |
+
+```bash
+# Pick up a new version of an existing rule without a pod restart:
+curl -X POST -H 'X-AERO-Key: <secret>' \
+  https://ruleforge.onrender.com/admin/refresh
+```
 
 ## Status
 

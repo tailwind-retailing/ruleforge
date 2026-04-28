@@ -13,8 +13,19 @@ public sealed class DocumentForgeReferenceSetSource : IReferenceSetSource
 {
     private readonly DfClient _client;
     private readonly ConcurrentDictionary<string, ReferenceSet> _cache = new();
+    private DateTimeOffset _lastRefreshedAt = DateTimeOffset.UtcNow;
+
+    public DateTimeOffset LastRefreshedAt => _lastRefreshedAt;
+    public int CachedRefSetCount => _cache.Count;
 
     public DocumentForgeReferenceSetSource(DfClient client) { _client = client; }
+
+    public Task RefreshAsync(CancellationToken ct = default)
+    {
+        _cache.Clear();
+        _lastRefreshedAt = DateTimeOffset.UtcNow;
+        return Task.CompletedTask;
+    }
 
     public async Task<ReferenceSet?> GetByIdAsync(string referenceId, CancellationToken ct = default)
     {

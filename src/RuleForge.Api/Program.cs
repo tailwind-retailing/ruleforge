@@ -70,11 +70,56 @@ foreach (var b in bindings)
         b.Method, endpointPath, b.RuleId, b.Version);
 }
 
-// List the bindings at /admin/bindings for ops sanity.
-app.MapGet("/admin/bindings", (IRuleSource source) =>
-    Results.Json(source.ListBindingsAsync().GetAwaiter().GetResult()));
+// ─── admin ──────────────────────────────────────────────────────────────────
+//
+// Two ops surfaces, both gated by ApiKeyMiddleware:
+//
+//   GET  /admin/bindings  — list the auto-registered endpoints + cache stats
+//   POST /admin/refresh   — flush the source caches (after a publish, etc.)
+//
+// Note: NEW endpoints still require a redeploy because routes are registered
+// at boot. /admin/refresh handles version changes within existing endpoints.
+
+app.MapGet("/admin/bindings", async (IRuleSource source, IServiceProvider sp) =>
+{
+    var live = await source.ListBindingsAsync();
+    return Results.Json(new
+    {
+        bindings = live,
+        registeredAtBoot = bindings,
+        cache = ReadCacheStats(source, sp.GetService<IReferenceSetSource>()),
+    });
+});
+
+app.MapPost("/admin/refresh", async (IRuleSource source, IServiceProvider sp, CancellationToken ct) =>
+{
+    var refSrc = sp.GetService<IReferenceSetSource>();
+    var refreshedAt = DateTimeOffset.UtcNow;
+    await source.RefreshAsync(ct);
+    if (refSrc is not null) await refSrc.RefreshAsync(ct);
+    return Results.Json(new
+    {
+        ok = true,
+        refreshedAt,
+        note = "Source caches dropped. Existing endpoint routes unchanged — adding " +
+               "a NEW endpoint requires a redeploy.",
+    });
+});
 
 await app.RunAsync();
+
+static object ReadCacheStats(IRuleSource ruleSrc, IReferenceSetSource? refSrc)
+{
+    var rules = ruleSrc as RuleForge.DocumentForge.DocumentForgeRuleSource;
+    var refs  = refSrc  as RuleForge.DocumentForge.DocumentForgeReferenceSetSource;
+    return new
+    {
+        ruleSnapshots = rules?.CachedSnapshotCount,
+        rulesLastRefreshedAt = rules?.LastRefreshedAt,
+        referenceSets = refs?.CachedRefSetCount,
+        refsLastRefreshedAt = refs?.LastRefreshedAt,
+    };
+}
 
 static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRunner runner, string endpoint)
 {

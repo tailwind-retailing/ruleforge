@@ -46,7 +46,7 @@ public class AdminEndpointTests
     }
 
     [Fact]
-    public async Task Bindings_lists_registered_endpoints_and_cache_stats()
+    public async Task Bindings_lists_live_endpoints_and_cache_stats()
     {
         using var factory = Factory(FixturesDir());
         using var client = factory.CreateClient();
@@ -56,17 +56,18 @@ public class AdminEndpointTests
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
 
         Assert.True(body.TryGetProperty("bindings", out var bindings));
-        Assert.True(body.TryGetProperty("registeredAtBoot", out var registered));
+        Assert.True(body.TryGetProperty("bindingCount", out var count));
         Assert.True(body.TryGetProperty("cache", out _));
+        Assert.True(body.TryGetProperty("routing", out var routing));
 
-        // The local-fixtures pack ships several rules; both lists should match.
         Assert.Equal(JsonValueKind.Array, bindings.ValueKind);
-        Assert.Equal(JsonValueKind.Array, registered.ValueKind);
         Assert.True(bindings.GetArrayLength() > 0);
+        Assert.Equal(bindings.GetArrayLength(), count.GetInt32());
+        Assert.Equal("dynamic", routing.GetString());
     }
 
     [Fact]
-    public async Task Refresh_returns_200_with_timestamp_and_note()
+    public async Task Refresh_returns_200_with_timestamp_and_live_bindings()
     {
         using var factory = Factory(FixturesDir());
         using var client = factory.CreateClient();
@@ -77,8 +78,14 @@ public class AdminEndpointTests
 
         Assert.True(body.GetProperty("ok").GetBoolean());
         Assert.True(body.TryGetProperty("refreshedAt", out _));
+        Assert.True(body.TryGetProperty("bindingCount", out var count));
+        Assert.True(body.TryGetProperty("bindings", out var bindings));
         Assert.True(body.TryGetProperty("note", out var note));
-        Assert.Contains("redeploy", note.GetString(), StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(count.GetInt32() > 0);
+        Assert.Equal(JsonValueKind.Array, bindings.ValueKind);
+        // The new note explicitly promises zero-redeploy semantics.
+        Assert.Contains("no redeploy", note.GetString(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

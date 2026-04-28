@@ -61,32 +61,17 @@ app.UseMiddleware<ApiKeyMiddleware>();
 
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
 
-// Auto-register every bound endpoint from the rule source.
-var bindings = await app.Services.GetRequiredService<IRuleSource>().ListBindingsAsync();
-foreach (var b in bindings)
-{
-    var endpointPath = b.Endpoint;
-    var route = b.Method switch
-    {
-        HttpMethodKind.GET  => app.MapGet(endpointPath, (HttpContext http, IRuleSource source, RuleRunner runner) =>
-            Dispatch(http, source, runner, endpointPath)),
-        HttpMethodKind.POST => app.MapPost(endpointPath, (HttpContext http, IRuleSource source, RuleRunner runner) =>
-            Dispatch(http, source, runner, endpointPath)),
-        _ => throw new NotSupportedException($"unsupported method {b.Method} for {endpointPath}"),
-    };
-    app.Logger.LogInformation("Bound {Method} {Endpoint} â†’ {RuleId}@{Version}",
-        b.Method, endpointPath, b.RuleId, b.Version);
-}
-
 // ─── admin ──────────────────────────────────────────────────────────────────
 //
 // Two ops surfaces, both gated by ApiKeyMiddleware:
 //
-//   GET  /admin/bindings  — list the auto-registered endpoints + cache stats
-//   POST /admin/refresh   — flush the source caches (after a publish, etc.)
+//   GET  /admin/bindings  — list live bindings + cache stats
+//   POST /admin/refresh   — flush source caches (after a publish, etc.)
 //
-// Note: NEW endpoints still require a redeploy because routes are registered
-// at boot. /admin/refresh handles version changes within existing endpoints.
+// Routing is dynamic (see catch-all below) so /admin/refresh now picks up
+// BOTH new versions AND new endpoints — no redeploy required for either.
+// Explicit /health and /admin/* routes have higher precedence than the
+// catch-all and so always win.
 
 app.MapGet("/admin/bindings", async (IRuleSource source, IServiceProvider sp) =>
 {
@@ -94,25 +79,61 @@ app.MapGet("/admin/bindings", async (IRuleSource source, IServiceProvider sp) =>
     return Results.Json(new
     {
         bindings = live,
-        registeredAtBoot = bindings,
+        bindingCount = live.Count,
         cache = ReadCacheStats(source, sp.GetService<IReferenceSetSource>()),
+        routing = "dynamic",
     });
 });
 
-app.MapPost("/admin/refresh", async (IRuleSource source, IServiceProvider sp, CancellationToken ct) =>
+app.MapPost("/admin/refresh", async (IRuleSource source, IServiceProvider sp, ILoggerFactory lf, CancellationToken ct) =>
 {
     var refSrc = sp.GetService<IReferenceSetSource>();
     var refreshedAt = DateTimeOffset.UtcNow;
     await source.RefreshAsync(ct);
     if (refSrc is not null) await refSrc.RefreshAsync(ct);
+    var live = await source.ListBindingsAsync();
+    var log = lf.CreateLogger("Refresh");
+    foreach (var b in live)
+        log.LogInformation("Rebound {Method} {Endpoint} -> {RuleId}@{Version}",
+            b.Method, b.Endpoint, b.RuleId, b.Version);
+    log.LogInformation("Refresh complete. {Count} binding(s) live.", live.Count);
     return Results.Json(new
     {
         ok = true,
         refreshedAt,
-        note = "Source caches dropped. Existing endpoint routes unchanged — adding " +
-               "a NEW endpoint requires a redeploy.",
+        bindingCount = live.Count,
+        bindings = live,
+        note = "Source caches dropped and bindings re-enumerated. New endpoints AND new versions are live immediately — no redeploy required.",
     });
 });
+
+// ─── boot enumeration (for log/observability only) ──────────────────────────
+//
+// Routing itself is dynamic — see the catch-all below. We still walk the
+// bindings at boot so the deploy log shows what's wired, and so anything
+// missing in DF (env doc, ruleversions row) blows up loudly at startup
+// rather than on the first request.
+var bootBindings = await app.Services.GetRequiredService<IRuleSource>().ListBindingsAsync();
+foreach (var b in bootBindings)
+{
+    app.Logger.LogInformation("Bound {Method} {Endpoint} -> {RuleId}@{Version}",
+        b.Method, b.Endpoint, b.RuleId, b.Version);
+}
+app.Logger.LogInformation(
+    "Discovered {Count} binding(s) at boot. Routing is dynamic — POST /admin/refresh to pick up changes.",
+    bootBindings.Count);
+
+// ─── dynamic catch-all ──────────────────────────────────────────────────────
+//
+// Every request not matched by an explicit route above resolves live via
+// IRuleSource.GetByEndpointAsync(path, method). That means publishing a
+// brand-new endpoint and POSTing /admin/refresh is enough — no redeploy.
+// The DF source already caches snapshots indefinitely (immutable per
+// version) and env bindings for 30s, so the steady-state cost is a
+// dictionary lookup.
+app.MapMethods("/{**path}", new[] { "GET", "POST" },
+    async (HttpContext http, IRuleSource source, RuleRunner runner) =>
+        await Dispatch(http, source, runner));
 
 await app.RunAsync();
 
@@ -129,13 +150,40 @@ static object ReadCacheStats(IRuleSource ruleSrc, IReferenceSetSource? refSrc)
     };
 }
 
-static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRunner runner, string endpoint)
+static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRunner runner)
 {
-    var rule = await source.GetByEndpointAsync(endpoint, HttpMethodKind.POST);
-    if (rule is null)
-        return Results.NotFound(new { error = $"no rule bound to POST {endpoint}" });
+    var endpoint = http.Request.Path.Value ?? "/";
+    var method = string.Equals(http.Request.Method, "GET", StringComparison.OrdinalIgnoreCase)
+        ? HttpMethodKind.GET
+        : HttpMethodKind.POST;
 
-    using var doc = await JsonDocument.ParseAsync(http.Request.Body);
+    var rule = await source.GetByEndpointAsync(endpoint, method);
+    if (rule is null)
+        return Results.NotFound(new { error = $"no rule bound to {http.Request.Method} {endpoint}" });
+
+    // Body is optional — GETs typically have none, and POSTs may legitimately
+    // ship empty bodies for parameterless rules. Default to {} when absent.
+    JsonElement payload;
+    if (http.Request.ContentLength is > 0
+        || (http.Request.ContentLength is null && http.Request.Body.CanRead && http.Request.Method == "POST"))
+    {
+        try
+        {
+            using var doc = await JsonDocument.ParseAsync(http.Request.Body);
+            payload = doc.RootElement.Clone();
+        }
+        catch (JsonException)
+        {
+            using var fallback = JsonDocument.Parse("{}");
+            payload = fallback.RootElement.Clone();
+        }
+    }
+    else
+    {
+        using var fallback = JsonDocument.Parse("{}");
+        payload = fallback.RootElement.Clone();
+    }
+
     var debug = http.Request.Query.ContainsKey("debug")
                 || (http.Request.Headers.TryGetValue("X-Debug", out var v)
                     && v.ToString().Equals("true", StringComparison.OrdinalIgnoreCase));
@@ -143,7 +191,7 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
     var refSource = http.RequestServices.GetService<IReferenceSetSource>();
     var envelope = await runner.RunAsync(
         rule,
-        doc.RootElement.Clone(),
+        payload,
         new RuleRunner.Options(
             Debug: debug,
             SubRuleSource: source,

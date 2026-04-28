@@ -17,22 +17,32 @@ public sealed class LocalFileRuleSource : IRuleSource
     private static readonly JsonSerializerOptions JsonOptions = AeroJson.Options;
 
     private readonly string _baseDir;
-    private readonly Dictionary<string, string> _bindings;
+    private Dictionary<string, string> _bindings;
 
     public LocalFileRuleSource(string baseDir)
     {
         _baseDir = baseDir;
-        var bindingsFile = Path.Combine(_baseDir, "_endpoint-bindings.json");
-        if (File.Exists(bindingsFile))
-        {
-            var json = File.ReadAllText(bindingsFile);
-            _bindings = JsonSerializer.Deserialize<Dictionary<string, string>>(json, JsonOptions)
-                        ?? new Dictionary<string, string>();
-        }
-        else
-        {
-            _bindings = new Dictionary<string, string>();
-        }
+        _bindings = LoadBindings(baseDir);
+    }
+
+    /// <summary>
+    /// Re-read <c>_endpoint-bindings.json</c> from disk. Mirrors DF-source
+    /// behavior so /admin/refresh picks up new endpoints in local mode too.
+    /// Individual rule files are read on every GetByIdAsync call already.
+    /// </summary>
+    public Task RefreshAsync(CancellationToken ct = default)
+    {
+        _bindings = LoadBindings(_baseDir);
+        return Task.CompletedTask;
+    }
+
+    private static Dictionary<string, string> LoadBindings(string baseDir)
+    {
+        var bindingsFile = Path.Combine(baseDir, "_endpoint-bindings.json");
+        if (!File.Exists(bindingsFile)) return new Dictionary<string, string>();
+        var json = File.ReadAllText(bindingsFile);
+        return JsonSerializer.Deserialize<Dictionary<string, string>>(json, JsonOptions)
+               ?? new Dictionary<string, string>();
     }
 
     public Task<Rule?> GetByEndpointAsync(string endpoint, HttpMethodKind method, CancellationToken ct = default)

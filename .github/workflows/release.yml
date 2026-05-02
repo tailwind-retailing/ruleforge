@@ -1,0 +1,60 @@
+# Build & publish RuleForge image to GHCR on every push to master.
+# Mirrors the workflow shape used in aerotoysio/documentforge.
+#
+# Auth: uses the auto-provisioned GITHUB_TOKEN — no PAT setup required.
+#
+# After the first successful run, set the package visibility to "Public" at:
+#   https://github.com/users/aerotoysio/packages/container/ruleforge/settings
+# (or give your runtime a docker-login if you'd rather keep it private).
+
+name: Build & publish ruleforge image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ruleforge
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=main-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

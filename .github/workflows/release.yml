@@ -61,6 +61,20 @@ jobs:
 
       - name: Trigger Watchtower deploy
         run: |
-          curl -fsS -X POST \
-            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
-            https://watchtower.vollandes.com/v1/update
+          # Watchtower processes one scan at a time and returns 429 to
+          # concurrent triggers. With multiple repos publishing close together,
+          # a 429 just means "try again in a few seconds" — not a real failure.
+          for attempt in 1 2 3 4 5 6; do
+            code=$(curl -s -o /tmp/wt.body -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
+              https://watchtower.vollandes.com/v1/update)
+            echo "attempt $attempt: HTTP $code"
+            cat /tmp/wt.body 2>/dev/null || true; echo
+            case "$code" in
+              200) exit 0 ;;
+              429) sleep $((attempt * 10)) ;;
+              *)   exit 1 ;;
+            esac
+          done
+          echo "Watchtower trigger: max retries exhausted"
+          exit 1

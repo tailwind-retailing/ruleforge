@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using RuleForge.Core.Evaluators;
@@ -23,7 +24,8 @@ public sealed class RuleRunner
         bool Debug = false,
         IRuleSource? SubRuleSource = null,
         IReferenceSetSource? ReferenceSetSource = null,
-        Func<DateTimeOffset>? Clock = null);
+        Func<DateTimeOffset>? Clock = null,
+        HttpClient? HttpClient = null);
 
     public Envelope Run(Rule rule, JsonElement request, bool debug = false) =>
         RunAsync(rule, request, new Options(Debug: debug)).GetAwaiter().GetResult();
@@ -343,6 +345,9 @@ public sealed class RuleRunner
 
             case NodeCategory.RuleRef:
                 return (Verdict.Pass, subRuleResult);
+
+            case NodeCategory.Api:
+                return await ExecuteApiAsync(node, frames, run, options, ct);
 
             default:
                 throw new NotSupportedException(
@@ -796,6 +801,121 @@ public sealed class RuleRunner
         }
 
         return (Verdict.Pass, JsonDocument.Parse(rows.ToJsonString()).RootElement);
+    }
+
+    // ─── api (outbound HTTP) ───────────────────────────────────────────────
+
+    private static async Task<(Verdict, JsonElement?)> ExecuteApiAsync(
+        RuleNode node, FrameStack frames, RunState run, Options options, CancellationToken ct)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"api '{node.Id}' has no config");
+        if (options.HttpClient is null)
+            throw new InvalidOperationException(
+                $"api '{node.Id}': no HttpClient on Options. The host must inject one.");
+
+        var cfg = ParseConfig<ApiConfig>(node, "api");
+        if (string.IsNullOrEmpty(cfg.Url))
+            throw new InvalidOperationException($"api '{node.Id}' missing url");
+        if (string.IsNullOrEmpty(cfg.Method))
+            throw new InvalidOperationException($"api '{node.Id}' missing method");
+        if (cfg.TimeoutMs <= 0)
+            throw new InvalidOperationException(
+                $"api '{node.Id}' timeoutMs must be > 0 (got {cfg.TimeoutMs})");
+
+        var url = ResolveStringField(cfg.Url, run, frames)
+                  ?? throw new InvalidOperationException($"api '{node.Id}': url resolved to null");
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            throw new InvalidOperationException(
+                $"api '{node.Id}': url '{url}' is not a valid absolute URI");
+
+        using var req = new HttpRequestMessage(new HttpMethod(cfg.Method.ToUpperInvariant()), uri);
+
+        string contentType = "application/json";
+        if (cfg.Headers is not null)
+        {
+            foreach (var (name, raw) in cfg.Headers)
+            {
+                if (string.Equals(name, "Content-Type", StringComparison.OrdinalIgnoreCase))
+                {
+                    contentType = ResolveStringField(raw, run, frames) ?? contentType;
+                    continue;   // applied to Content below if a body is present
+                }
+                var v = ResolveStringField(raw, run, frames);
+                if (v is null) continue;
+                req.Headers.TryAddWithoutValidation(name, v);
+            }
+        }
+
+        if (cfg.Body.HasValue)
+        {
+            var resolvedBody = ResolveCtxPlaceholders(cfg.Body.Value, run.Ctx, run.Request, frames);
+            req.Content = new StringContent(resolvedBody.GetRawText(), Encoding.UTF8, contentType);
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(cfg.TimeoutMs);
+
+        HttpResponseMessage resp;
+        try
+        {
+            resp = await options.HttpClient.SendAsync(req, cts.Token);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                $"api '{node.Id}': request to {uri} timed out after {cfg.TimeoutMs}ms");
+        }
+
+        using (resp)
+        {
+            if (!resp.IsSuccessStatusCode)
+                throw new InvalidOperationException(
+                    $"api '{node.Id}': {req.Method} {uri} returned {(int)resp.StatusCode} {resp.ReasonPhrase}");
+
+            var raw = await resp.Content.ReadAsStringAsync(ct);
+            if (string.IsNullOrEmpty(raw))
+                return (Verdict.Pass, JsonDocument.Parse("null").RootElement);
+
+            JsonElement body;
+            try
+            {
+                body = JsonDocument.Parse(raw).RootElement.Clone();
+            }
+            catch (JsonException e)
+            {
+                throw new InvalidOperationException(
+                    $"api '{node.Id}': response body is not valid JSON: {e.Message}", e);
+            }
+
+            if (string.IsNullOrEmpty(cfg.ResponseMap))
+                return (Verdict.Pass, body);
+
+            var mapped = JsonPath.Resolve(body, cfg.ResponseMap).FirstOrDefault();
+            return (Verdict.Pass, mapped);
+        }
+    }
+
+    /// <summary>
+    /// Resolve a string config field. Values starting with <c>$</c> are JSONPaths
+    /// (against request, <c>$ctx.x</c>, or open iteration frames); other values
+    /// are literals. Non-string resolved values are stringified.
+    /// </summary>
+    private static string? ResolveStringField(string raw, RunState run, FrameStack frames)
+    {
+        if (string.IsNullOrEmpty(raw)) return raw;
+        if (raw[0] != '$') return raw;
+        var resolved = ResolveFromPath(raw, run.Request, run.Ctx, frames);
+        if (!resolved.HasValue) return null;
+        return resolved.Value.ValueKind switch
+        {
+            JsonValueKind.String => resolved.Value.GetString(),
+            JsonValueKind.Number => resolved.Value.ToString(),
+            JsonValueKind.True   => "true",
+            JsonValueKind.False  => "false",
+            JsonValueKind.Null   => null,
+            _                    => resolved.Value.GetRawText(),
+        };
     }
 
     // ─── merge ─────────────────────────────────────────────────────────────

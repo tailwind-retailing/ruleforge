@@ -47,6 +47,12 @@ else
     builder.Services.AddSingleton<IReferenceSetSource>(_ => new LocalFileReferenceSetSource(Path.GetFullPath(refsDir)));
 }
 
+// Shared HttpClient for `api` node outbound calls. Per-call deadlines are
+// enforced via CancellationTokenSource in the runner (api node's mandatory
+// `timeoutMs`), so the client itself is set to infinite — let the per-call
+// CTS be authoritative. This is distinct from DfClient's own HttpClient.
+builder.Services.AddSingleton(new HttpClient { Timeout = Timeout.InfiniteTimeSpan });
+
 builder.Services.AddSingleton<RuleRunner>();
 builder.Services.ConfigureHttpJsonOptions(o =>
 {
@@ -189,13 +195,15 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
                     && v.ToString().Equals("true", StringComparison.OrdinalIgnoreCase));
 
     var refSource = http.RequestServices.GetService<IReferenceSetSource>();
+    var apiHttp = http.RequestServices.GetService<HttpClient>();
     var envelope = await runner.RunAsync(
         rule,
         payload,
         new RuleRunner.Options(
             Debug: debug,
             SubRuleSource: source,
-            ReferenceSetSource: refSource),
+            ReferenceSetSource: refSource,
+            HttpClient: apiHttp),
         http.RequestAborted);
     return Results.Json(envelope);
 }

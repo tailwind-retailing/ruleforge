@@ -732,6 +732,7 @@ static int SchemasVerb(string[] argv)
         ("iterator-config.schema.json",      typeof(RuleForge.Core.Models.IteratorConfig),      "Iterator config"),
         ("merge-config.schema.json",         typeof(RuleForge.Core.Models.MergeConfig),         "Merge config"),
         ("reference-config.schema.json",     typeof(RuleForge.Core.Graph.ReferenceConfig),      "Reference (multi-row lookup) config"),
+        ("api-config.schema.json",           typeof(RuleForge.Core.Models.ApiConfig),           "API (outbound HTTP) node config"),
         ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
     };
 

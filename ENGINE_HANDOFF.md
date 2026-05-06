@@ -129,7 +129,7 @@ For risky rule changes, run the new draft version in shadow alongside published 
 - DSL escape hatch — sometimes business users want a one-liner inline expression that doesn't fit nodes. Drools/DMN allow this; we don't yet. Defer until users actually ask. (We see this as a positioning trap — slippery slope to half the rules being in DSL and the visual graph becoming decoration. The calc node already covers most "one-liner" needs.)
 - Decision-table coverage analysis (DMN-style gap detection). Defer until we have enough rules to need it.
 - Parallel evaluation across pax / bounds (our iterator is sequential). Profile first.
-- **New node templates and category implementations.** The `NodeCategory` enum at `RuleRunner.cs` declares `api`, `sql`, `product`, `reference`, `constant`, etc., but the switch at `RuleRunner.cs:308` only implements a subset — the rest fall through to `NotSupportedException` at line 348. If we want a `call endpoint` node (under the existing `api` category), engine ships the evaluator first, editor curates the template after. Out of scope for THIS pass — see "Schema contract handoff" for the flow.
+- **New node templates and unimplemented categories.** The `NodeCategory` enum at `Models/RuleNode.cs` declares 14 categories. The switch at `RuleRunner.cs:308` implements 12 of them; **only `api` and `sql` actually fall through to `NotSupportedException` at line 348.** Separate concern: `product` is implemented but its name is misleading — the implementation is output-shape assembly, not Cartesian product (see GitHub issue #5). If we want a `call endpoint` node (under the existing `api` category), engine ships the evaluator first, editor curates the template after. Out of scope for THIS pass — see "Schema contract handoff" for the flow.
 
 ---
 
@@ -141,7 +141,7 @@ For risky rule changes, run the new draft version in shadow alongside published 
 ## What you DO own (clarification — schema control sits with the engine)
 
 - **The canonical schema** for rules, nodes, bindings, and traces. The engine publishes the schema (already wired via the `schemas` CLI verb in `README.md:98`); the editor consumes it and generates its TS types from that output. **New schema additions flow engine → editor, not the other way around.** The conceptual model — nodes / bindings / DAG / branches — is locked at the *category* level, but adding fields within those categories is fair game (with a handoff note to the editor team).
-- **All evaluators for declared node categories**: `input | output | iterator | merge | filter | mutator | calc | constant | ruleRef | logic | product | reference | sql | api`. If a category is declared but missing an evaluator (today: `api`, `sql`, `product`, `constant`, `reference` — the switch at `RuleRunner.cs:308` only handles a subset), shipping the evaluator is engine-track work. The editor track curates *templates* within those categories.
+- **All evaluators for declared node categories**: `input | output | iterator | merge | filter | mutator | calc | constant | ruleRef | logic | product | reference | sql | api`. Today only `api` and `sql` are declared but unimplemented — the switch at `RuleRunner.cs:308` falls through to `NotSupportedException` at line 348 for those two. Shipping those evaluators is engine-track work. The editor track curates *templates* within those categories.
 
 ---
 
@@ -210,7 +210,7 @@ Total: ~11-13 days for one engineer. Each item lands as a self-contained PR with
 - `ruleforge/src/RuleForge.Core/Graph/RuleRunner.cs:906-968` — `InvokeSubRuleAsync`. Depth limit + inter-rule cycle detection go here.
 - `ruleforge/src/RuleForge.Core/Graph/RuleRunner.cs:135` — trace `e.Message` leak point.
 - `ruleforge/src/RuleForge.Core/Graph/RuleRunner.cs:1267-1280` — current `HasCycle` (intra-rule only); reference for the inter-rule version.
-- `ruleforge/src/RuleForge.Core/Graph/RuleRunner.cs:308` — the category switch, where missing evaluators (`api`, `sql`, `product`, `constant`, `reference`) fall through to `NotSupportedException` at line 348.
+- `ruleforge/src/RuleForge.Core/Graph/RuleRunner.cs:308` — the category switch. Only `api` and `sql` fall through to `NotSupportedException` at line 348 today; the other 12 categories are implemented inline.
 - `ruleforge/src/RuleForge.Core/Evaluators/CalcEvaluator.cs:43` — NCalc evaluation. Cancellation timeout wraps this call; `expr.EvaluateFunction` whitelist hook also lives at line 32.
 
 Questions: ping the editor track for type/storage questions, but the engine track owns the schema — see "Schema contract handoff". Don't guess at types or storage layout.

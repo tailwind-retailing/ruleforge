@@ -739,6 +739,8 @@ static int SchemasVerb(string[] argv)
         ("sort-config.schema.json",          typeof(RuleForge.Core.Models.SortConfig),          "Sort (array order by key) node config"),
         ("limit-config.schema.json",         typeof(RuleForge.Core.Models.LimitConfig),         "Limit (top-N / slice) node config"),
         ("distinct-config.schema.json",      typeof(RuleForge.Core.Models.DistinctConfig),      "Distinct (dedupe by key) node config"),
+        ("switch-config.schema.json",        typeof(RuleForge.Core.Models.SwitchConfig),        "Switch (multi-way branch) node config"),
+        ("group-by-config.schema.json",      typeof(RuleForge.Core.Models.GroupByConfig),       "GroupBy (partition array by key) node config"),
         ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
     };
 

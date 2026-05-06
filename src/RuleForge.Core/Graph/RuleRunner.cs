@@ -364,6 +364,12 @@ public sealed class RuleRunner
             case NodeCategory.Distinct:
                 return (Verdict.Pass, ExecuteDistinct(node, frames, graph, run));
 
+            case NodeCategory.Switch:
+                return (Verdict.Pass, ExecuteSwitch(node, frames, run));
+
+            case NodeCategory.GroupBy:
+                return (Verdict.Pass, ExecuteGroupBy(node, frames, graph, run));
+
             default:
                 throw new NotSupportedException(
                     $"node category '{node.Data.Category}' is not implemented (node {node.Id})");
@@ -931,6 +937,96 @@ public sealed class RuleRunner
             JsonValueKind.Null   => null,
             _                    => resolved.Value.GetRawText(),
         };
+    }
+
+    // ─── switch (multi-way branch on a resolved value) ─────────────────────
+
+    private static JsonElement ExecuteSwitch(RuleNode node, FrameStack frames, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"switch '{node.Id}' has no config");
+        var cfg = ParseConfig<SwitchConfig>(node, "switch");
+        if (string.IsNullOrEmpty(cfg.Input))
+            throw new InvalidOperationException($"switch '{node.Id}' missing input");
+        if (cfg.Cases is null || cfg.Cases.Count == 0)
+            throw new InvalidOperationException($"switch '{node.Id}' has no cases");
+
+        var inputEl = ResolveFromPath(cfg.Input, run.Request, run.Ctx, frames);
+        foreach (var c in cfg.Cases)
+        {
+            if (string.IsNullOrEmpty(c.Name))
+                throw new InvalidOperationException($"switch '{node.Id}': case has empty name");
+            if (JsonValuesMatch(inputEl, c.Match))
+                return JsonDocument.Parse(JsonSerializer.Serialize(c.Name)).RootElement;
+        }
+
+        if (string.IsNullOrEmpty(cfg.Default))
+            throw new InvalidOperationException(
+                $"switch '{node.Id}': no case matched and no default configured");
+        return JsonDocument.Parse(JsonSerializer.Serialize(cfg.Default)).RootElement;
+    }
+
+    private static bool JsonValuesMatch(JsonElement? a, JsonElement b)
+    {
+        if (!a.HasValue) return b.ValueKind == JsonValueKind.Null;
+        var av = a.Value;
+        if (av.ValueKind == JsonValueKind.Null) return b.ValueKind == JsonValueKind.Null;
+        if (av.ValueKind == JsonValueKind.Number && b.ValueKind == JsonValueKind.Number)
+            return av.GetDouble() == b.GetDouble();
+        if (av.ValueKind == JsonValueKind.String && b.ValueKind == JsonValueKind.String)
+            return string.Equals(av.GetString(), b.GetString(), StringComparison.Ordinal);
+        if ((av.ValueKind == JsonValueKind.True || av.ValueKind == JsonValueKind.False)
+            && (b.ValueKind == JsonValueKind.True || b.ValueKind == JsonValueKind.False))
+            return av.ValueKind == b.ValueKind;
+        // Mixed types or composites: deterministic raw-text equality.
+        return string.Equals(av.GetRawText(), b.GetRawText(), StringComparison.Ordinal);
+    }
+
+    // ─── groupBy (partition array by key) ──────────────────────────────────
+
+    private static JsonElement ExecuteGroupBy(
+        RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"groupBy '{node.Id}' has no config");
+        var cfg = ParseConfig<GroupByConfig>(node, "groupBy");
+        if (string.IsNullOrEmpty(cfg.GroupKey))
+            throw new InvalidOperationException($"groupBy '{node.Id}' missing groupKey");
+
+        var input = ReadUpstreamArray(node, frames, graph, run, "groupBy");
+        var keyOf = MakeKeyExtractor(cfg.GroupKey);
+
+        // Preserve first-seen group order for deterministic output.
+        var groupOrder = new List<string>();
+        var groups = new Dictionary<string, List<JsonElement>>(StringComparer.Ordinal);
+        foreach (var el in input)
+        {
+            var keyEl = keyOf(el);
+            string keyStr;
+            if (!keyEl.HasValue || keyEl.Value.ValueKind == JsonValueKind.Null)
+                keyStr = "";
+            else if (keyEl.Value.ValueKind == JsonValueKind.String)
+                keyStr = keyEl.Value.GetString() ?? "";
+            else
+                keyStr = keyEl.Value.GetRawText();
+
+            if (!groups.TryGetValue(keyStr, out var list))
+            {
+                list = new List<JsonElement>();
+                groups[keyStr] = list;
+                groupOrder.Add(keyStr);
+            }
+            list.Add(el);
+        }
+
+        var obj = new JsonObject();
+        foreach (var k in groupOrder)
+        {
+            var arr = new JsonArray();
+            foreach (var el in groups[k]) arr.Add(JsonNode.Parse(el.GetRawText()));
+            obj[k] = arr;
+        }
+        return JsonDocument.Parse(obj.ToJsonString()).RootElement;
     }
 
     // ─── sort / limit / distinct (array transforms) ────────────────────────

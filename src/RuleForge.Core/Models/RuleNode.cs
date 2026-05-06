@@ -44,6 +44,8 @@ public enum NodeCategory
     [JsonStringEnumMemberName("sort")] Sort,
     [JsonStringEnumMemberName("limit")] Limit,
     [JsonStringEnumMemberName("distinct")] Distinct,
+    [JsonStringEnumMemberName("switch")] Switch,
+    [JsonStringEnumMemberName("groupBy")] GroupBy,
 }
 
 public sealed record SubRuleCall(

@@ -734,6 +734,7 @@ static int SchemasVerb(string[] argv)
         ("reference-config.schema.json",     typeof(RuleForge.Core.Graph.ReferenceConfig),      "Reference (multi-row lookup) config"),
         ("api-config.schema.json",           typeof(RuleForge.Core.Models.ApiConfig),           "API (outbound HTTP) node config"),
         ("constant-config.schema.json",      typeof(RuleForge.Core.Models.ConstantConfig),      "Constant (literal value) node config"),
+        ("bucket-config.schema.json",        typeof(RuleForge.Core.Models.BucketConfig),        "Bucket (deterministic A/B sticky-hash) node config"),
         ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
     };
 

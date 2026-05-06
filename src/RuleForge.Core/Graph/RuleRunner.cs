@@ -349,6 +349,9 @@ public sealed class RuleRunner
             case NodeCategory.Api:
                 return await ExecuteApiAsync(node, frames, run, options, ct);
 
+            case NodeCategory.Bucket:
+                return (Verdict.Pass, ExecuteBucket(node, frames, run));
+
             default:
                 throw new NotSupportedException(
                     $"node category '{node.Data.Category}' is not implemented (node {node.Id})");
@@ -916,6 +919,77 @@ public sealed class RuleRunner
             JsonValueKind.Null   => null,
             _                    => resolved.Value.GetRawText(),
         };
+    }
+
+    // ─── bucket (deterministic A/B sticky-hash) ────────────────────────────
+
+    private static JsonElement? ExecuteBucket(RuleNode node, FrameStack frames, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"bucket '{node.Id}' has no config");
+
+        var cfg = ParseConfig<BucketConfig>(node, "bucket");
+        if (string.IsNullOrEmpty(cfg.HashKey))
+            throw new InvalidOperationException($"bucket '{node.Id}' missing hashKey");
+        if (cfg.Buckets is null || cfg.Buckets.Count == 0)
+            throw new InvalidOperationException($"bucket '{node.Id}' has no buckets");
+
+        var keyEl = ResolveFromPath(cfg.HashKey, run.Request, run.Ctx, frames);
+        if (!keyEl.HasValue)
+            throw new InvalidOperationException(
+                $"bucket '{node.Id}': hashKey '{cfg.HashKey}' resolved to no value");
+
+        var keyStr = keyEl.Value.ValueKind switch
+        {
+            JsonValueKind.String => keyEl.Value.GetString() ?? "",
+            JsonValueKind.Null   => "",
+            _                    => keyEl.Value.GetRawText(),
+        };
+
+        long totalWeight = 0;
+        foreach (var b in cfg.Buckets)
+        {
+            if (b.Weight < 0)
+                throw new InvalidOperationException(
+                    $"bucket '{node.Id}': bucket '{b.Name}' has negative weight {b.Weight}");
+            totalWeight += b.Weight;
+        }
+        if (totalWeight <= 0)
+            throw new InvalidOperationException(
+                $"bucket '{node.Id}': total weight must be > 0");
+
+        var hash = Fnv1a32(keyStr);
+        var pick = (long)(hash % (uint)totalWeight);
+        long cumulative = 0;
+        foreach (var b in cfg.Buckets)
+        {
+            if (b.Weight <= 0) continue;
+            cumulative += b.Weight;
+            if (pick < cumulative)
+                return JsonDocument.Parse(JsonSerializer.Serialize(b.Name)).RootElement;
+        }
+        // Unreachable under the bounds above.
+        throw new InvalidOperationException(
+            $"bucket '{node.Id}': bucket selection failed (logic error)");
+    }
+
+    /// <summary>
+    /// FNV-1a 32-bit hash over UTF-8 bytes. Stable across versions and
+    /// platforms — bucket assignment must be reproducible for the same key
+    /// across engine restarts and deployments.
+    /// </summary>
+    private static uint Fnv1a32(string s)
+    {
+        const uint offset = 2166136261u;
+        const uint prime = 16777619u;
+        uint h = offset;
+        var bytes = Encoding.UTF8.GetBytes(s);
+        foreach (var b in bytes)
+        {
+            h ^= b;
+            h *= prime;
+        }
+        return h;
     }
 
     // ─── merge ─────────────────────────────────────────────────────────────

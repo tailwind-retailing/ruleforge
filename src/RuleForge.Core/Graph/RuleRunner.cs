@@ -355,6 +355,15 @@ public sealed class RuleRunner
             case NodeCategory.Assert:
                 return (Verdict.Pass, ExecuteAssert(node, frames, graph, run));
 
+            case NodeCategory.Sort:
+                return (Verdict.Pass, ExecuteSort(node, frames, graph, run));
+
+            case NodeCategory.Limit:
+                return (Verdict.Pass, ExecuteLimit(node, frames, graph, run));
+
+            case NodeCategory.Distinct:
+                return (Verdict.Pass, ExecuteDistinct(node, frames, graph, run));
+
             default:
                 throw new NotSupportedException(
                     $"node category '{node.Data.Category}' is not implemented (node {node.Id})");
@@ -922,6 +931,130 @@ public sealed class RuleRunner
             JsonValueKind.Null   => null,
             _                    => resolved.Value.GetRawText(),
         };
+    }
+
+    // ─── sort / limit / distinct (array transforms) ────────────────────────
+
+    private static JsonElement ExecuteSort(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"sort '{node.Id}' has no config");
+        var cfg = ParseConfig<SortConfig>(node, "sort");
+        var direction = string.IsNullOrEmpty(cfg.Direction) ? "asc" : cfg.Direction.ToLowerInvariant();
+        if (direction != "asc" && direction != "desc")
+            throw new InvalidOperationException(
+                $"sort '{node.Id}': direction must be 'asc' or 'desc' (got '{cfg.Direction}')");
+        var nulls = string.IsNullOrEmpty(cfg.Nulls) ? "last" : cfg.Nulls.ToLowerInvariant();
+        if (nulls != "first" && nulls != "last" && nulls != "error")
+            throw new InvalidOperationException(
+                $"sort '{node.Id}': nulls must be 'first', 'last', or 'error' (got '{cfg.Nulls}')");
+
+        var input = ReadUpstreamArray(node, frames, graph, run, "sort");
+        if (input.Count <= 1) return MakeArray(input);
+
+        var keyOf = MakeKeyExtractor(cfg.SortKey);
+        var copy = input.ToList();
+        copy.Sort((a, b) => CompareWithNulls(keyOf(a), keyOf(b), nulls, node.Id));
+        if (direction == "desc") copy.Reverse();
+        return MakeArray(copy);
+    }
+
+    private static JsonElement ExecuteLimit(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"limit '{node.Id}' has no config");
+        var cfg = ParseConfig<LimitConfig>(node, "limit");
+        if (cfg.Count < 0)
+            throw new InvalidOperationException(
+                $"limit '{node.Id}': count must be >= 0 (got {cfg.Count})");
+        var offset = cfg.Offset ?? 0;
+        if (offset < 0)
+            throw new InvalidOperationException(
+                $"limit '{node.Id}': offset must be >= 0 (got {offset})");
+
+        var input = ReadUpstreamArray(node, frames, graph, run, "limit");
+        return MakeArray(input.Skip(offset).Take(cfg.Count));
+    }
+
+    private static JsonElement ExecuteDistinct(RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"distinct '{node.Id}' has no config");
+        var cfg = ParseConfig<DistinctConfig>(node, "distinct");
+        var keep = string.IsNullOrEmpty(cfg.Keep) ? "first" : cfg.Keep.ToLowerInvariant();
+        if (keep != "first" && keep != "last")
+            throw new InvalidOperationException(
+                $"distinct '{node.Id}': keep must be 'first' or 'last' (got '{cfg.Keep}')");
+
+        var input = ReadUpstreamArray(node, frames, graph, run, "distinct");
+        var keyOf = MakeKeyExtractor(cfg.Key);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var output = new List<JsonElement>();
+        var source = keep == "last" ? input.AsEnumerable().Reverse() : input;
+        foreach (var el in source)
+        {
+            var keyEl = keyOf(el);
+            var keyStr = keyEl.HasValue ? keyEl.Value.GetRawText() : "<null>";
+            if (seen.Add(keyStr)) output.Add(el);
+        }
+        if (keep == "last") output.Reverse();
+        return MakeArray(output);
+    }
+
+    private static List<JsonElement> ReadUpstreamArray(
+        RuleNode node, FrameStack frames, GraphInfo graph, RunState run, string nodeKind)
+    {
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var upstream = inEdges.Select(e => e.Source).Distinct()
+            .Where(s => run.NodeOutputs.ContainsKey(run.Key(s, frames)))
+            .Select(s => run.NodeOutputs[run.Key(s, frames)])
+            .ToList();
+        if (upstream.Count != 1)
+            throw new InvalidOperationException(
+                $"{nodeKind} '{node.Id}' has {upstream.Count} upstream outputs — exactly one required");
+        var arr = upstream[0];
+        if (arr.ValueKind != JsonValueKind.Array)
+            throw new InvalidOperationException(
+                $"{nodeKind} '{node.Id}': upstream is not a JSON array (got {arr.ValueKind})");
+        return arr.EnumerateArray().ToList();
+    }
+
+    private static Func<JsonElement, JsonElement?> MakeKeyExtractor(string? path)
+    {
+        if (string.IsNullOrEmpty(path) || path == "self" || path == "$")
+            return el => el;
+        return el => JsonPath.Resolve(el, path).FirstOrDefault();
+    }
+
+    private static int CompareWithNulls(JsonElement? a, JsonElement? b, string nullHandling, string nodeId)
+    {
+        var aNull = !a.HasValue || a.Value.ValueKind == JsonValueKind.Null;
+        var bNull = !b.HasValue || b.Value.ValueKind == JsonValueKind.Null;
+        if (aNull && bNull) return 0;
+        if (aNull)
+        {
+            if (nullHandling == "error")
+                throw new InvalidOperationException($"sort '{nodeId}': encountered null sort key");
+            return nullHandling == "first" ? -1 : 1;
+        }
+        if (bNull)
+        {
+            if (nullHandling == "error")
+                throw new InvalidOperationException($"sort '{nodeId}': encountered null sort key");
+            return nullHandling == "first" ? 1 : -1;
+        }
+        return CompareJsonElements(a.Value, b.Value);
+    }
+
+    private static int CompareJsonElements(JsonElement a, JsonElement b)
+    {
+        if (a.ValueKind == JsonValueKind.Number && b.ValueKind == JsonValueKind.Number)
+            return a.GetDouble().CompareTo(b.GetDouble());
+        if (a.ValueKind == JsonValueKind.String && b.ValueKind == JsonValueKind.String)
+            return string.Compare(a.GetString(), b.GetString(), StringComparison.Ordinal);
+        // Mixed / other types: deterministic order via raw text. Not semantically
+        // meaningful — callers should ensure homogeneous key types in practice.
+        return string.Compare(a.GetRawText(), b.GetRawText(), StringComparison.Ordinal);
     }
 
     // ─── assert (invariant guard) ──────────────────────────────────────────

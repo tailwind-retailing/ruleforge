@@ -41,6 +41,9 @@ public enum NodeCategory
     [JsonStringEnumMemberName("merge")] Merge,
     [JsonStringEnumMemberName("bucket")] Bucket,
     [JsonStringEnumMemberName("assert")] Assert,
+    [JsonStringEnumMemberName("sort")] Sort,
+    [JsonStringEnumMemberName("limit")] Limit,
+    [JsonStringEnumMemberName("distinct")] Distinct,
 }
 
 public sealed record SubRuleCall(

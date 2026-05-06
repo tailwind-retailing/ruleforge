@@ -736,6 +736,9 @@ static int SchemasVerb(string[] argv)
         ("constant-config.schema.json",      typeof(RuleForge.Core.Models.ConstantConfig),      "Constant (literal value) node config"),
         ("bucket-config.schema.json",        typeof(RuleForge.Core.Models.BucketConfig),        "Bucket (deterministic A/B sticky-hash) node config"),
         ("assert-config.schema.json",        typeof(RuleForge.Core.Models.AssertConfig),        "Assert (invariant guard) node config"),
+        ("sort-config.schema.json",          typeof(RuleForge.Core.Models.SortConfig),          "Sort (array order by key) node config"),
+        ("limit-config.schema.json",         typeof(RuleForge.Core.Models.LimitConfig),         "Limit (top-N / slice) node config"),
+        ("distinct-config.schema.json",      typeof(RuleForge.Core.Models.DistinctConfig),      "Distinct (dedupe by key) node config"),
         ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
     };
 

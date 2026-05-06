@@ -352,6 +352,9 @@ public sealed class RuleRunner
             case NodeCategory.Bucket:
                 return (Verdict.Pass, ExecuteBucket(node, frames, run));
 
+            case NodeCategory.Assert:
+                return (Verdict.Pass, ExecuteAssert(node, frames, graph, run));
+
             default:
                 throw new NotSupportedException(
                     $"node category '{node.Data.Category}' is not implemented (node {node.Id})");
@@ -918,6 +921,48 @@ public sealed class RuleRunner
             JsonValueKind.False  => "false",
             JsonValueKind.Null   => null,
             _                    => resolved.Value.GetRawText(),
+        };
+    }
+
+    // ─── assert (invariant guard) ──────────────────────────────────────────
+
+    private static JsonElement? ExecuteAssert(
+        RuleNode node, FrameStack frames, GraphInfo graph, RunState run)
+    {
+        if (node.Data.Config is null)
+            throw new InvalidOperationException($"assert '{node.Id}' has no config");
+        var cfg = ParseConfig<AssertConfig>(node, "assert");
+        if (string.IsNullOrEmpty(cfg.Condition))
+            throw new InvalidOperationException($"assert '{node.Id}' missing condition");
+
+        var inEdges = graph.Incoming.GetValueOrDefault(node.Id) ?? new List<RuleEdge>();
+        var upstream = inEdges.Select(e => e.Source).Distinct()
+            .Where(s => run.NodeOutputs.ContainsKey(run.Key(s, frames)))
+            .Select(s => run.NodeOutputs[run.Key(s, frames)])
+            .ToList();
+        var upstreamEl = upstream.Count == 1 ? upstream[0] : (JsonElement?)null;
+
+        var result = CalcEvaluator.Evaluate(cfg.Condition, upstreamEl, run.Ctx, run.Request, frames.ToList());
+        if (IsTruthy(result))
+            return upstreamEl;   // pass-through on success
+
+        var code = string.IsNullOrEmpty(cfg.ErrorCode) ? "ASSERT_FAILED" : cfg.ErrorCode;
+        var msg = string.IsNullOrEmpty(cfg.ErrorMessage) ? cfg.Condition : cfg.ErrorMessage;
+        throw new InvalidOperationException($"assert '{node.Id}' [{code}]: {msg}");
+    }
+
+    private static bool IsTruthy(JsonElement? el)
+    {
+        if (!el.HasValue) return false;
+        return el.Value.ValueKind switch
+        {
+            JsonValueKind.True      => true,
+            JsonValueKind.False     => false,
+            JsonValueKind.Number    => el.Value.TryGetDouble(out var d) && d != 0,
+            JsonValueKind.String    => !string.IsNullOrEmpty(el.Value.GetString()),
+            JsonValueKind.Null      => false,
+            JsonValueKind.Undefined => false,
+            _                       => true,    // objects / arrays are truthy
         };
     }
 

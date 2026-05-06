@@ -40,6 +40,7 @@ public enum NodeCategory
     [JsonStringEnumMemberName("iterator")] Iterator,
     [JsonStringEnumMemberName("merge")] Merge,
     [JsonStringEnumMemberName("bucket")] Bucket,
+    [JsonStringEnumMemberName("assert")] Assert,
 }
 
 public sealed record SubRuleCall(

@@ -211,6 +211,20 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
         payload = fallback.RootElement.Clone();
     }
 
+    // Schema validation gate — reject the request before evaluation if it
+    // doesn't conform to the rule's inputSchema. Empty schemas (the common
+    // case for unconstrained rules) skip validation. Returns a structured
+    // 400 with the first violation path.
+    var validationError = SchemaValidator.Validate(rule.InputSchema, payload);
+    if (validationError is not null)
+    {
+        return Results.BadRequest(new
+        {
+            error = "schema_validation_failed",
+            detail = validationError,
+        });
+    }
+
     var debug = http.Request.Query.ContainsKey("debug")
                 || (http.Request.Headers.TryGetValue("X-Debug", out var v)
                     && v.ToString().Equals("true", StringComparison.OrdinalIgnoreCase));

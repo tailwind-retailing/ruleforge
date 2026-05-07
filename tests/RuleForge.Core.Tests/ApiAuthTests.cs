@@ -71,7 +71,7 @@ public class ApiAuthTests
 
         var resp = await client.PostAsJsonAsync(
             "/v1/ancillary/bag-policy",
-            new { cabin = "Y", orig = "LHR", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
+            new { cabin = "Y", orig = "LHR", dest = "DXB", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
     }
 
@@ -85,7 +85,7 @@ public class ApiAuthTests
 
         var resp = await client.PostAsJsonAsync(
             "/v1/ancillary/bag-policy",
-            new { cabin = "Y", orig = "LHR", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
+            new { cabin = "Y", orig = "LHR", dest = "DXB", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
     }
 
@@ -110,7 +110,7 @@ public class ApiAuthTests
 
         var resp = await client.PostAsJsonAsync(
             "/v1/ancillary/bag-policy",
-            new { cabin = "Y", orig = "LHR", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
+            new { cabin = "Y", orig = "LHR", dest = "DXB", bagPieces = 3, route = "LHR-DXB", markup = 0.0 });
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
     }
 }

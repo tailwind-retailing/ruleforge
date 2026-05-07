@@ -77,18 +77,22 @@ public class RequestLimitsTests
         using var factory = Factory(FixturesDir());
         using var client = factory.CreateClient();
 
-        // 10 levels — comfortably under MaxDepth=32. Just verifying that the
-        // depth cap isn't accidentally too tight for realistic payloads.
-        var sb = new StringBuilder();
-        for (var i = 0; i < 10; i++) sb.Append("{\"a\":");
-        sb.Append("0");
-        for (var i = 0; i < 10; i++) sb.Append('}');
+        // Wrap a 10-level nested blob inside an additional `meta` field of an
+        // otherwise-valid bag-policy payload. This way the depth cap is
+        // exercised but the schema validation gate (now active) doesn't trip
+        // on missing required fields.
+        var nested = new StringBuilder();
+        for (var i = 0; i < 10; i++) nested.Append("{\"a\":");
+        nested.Append("0");
+        for (var i = 0; i < 10; i++) nested.Append('}');
 
-        var content = new StringContent(sb.ToString(), Encoding.UTF8, "application/json");
+        var body = "{\"cabin\":\"Y\",\"orig\":\"LHR\",\"dest\":\"DXB\",\"bagPieces\":1," +
+                   $"\"meta\":{nested}}}";
+        var content = new StringContent(body, Encoding.UTF8, "application/json");
         var resp = await client.PostAsync("/v1/ancillary/bag-policy", content);
 
         // Whatever the rule decides (apply / skip / error) — we only care
-        // that JSON parsing succeeded and the body wasn't 400.
+        // that JSON parsing + schema validation succeeded and the body wasn't 400.
         Assert.NotEqual(HttpStatusCode.BadRequest, resp.StatusCode);
     }
 }

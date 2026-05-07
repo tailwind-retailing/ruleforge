@@ -18,8 +18,13 @@ public static class CalcEvaluator
     /// cancellation, so we race <c>Evaluate()</c> against this on a Task. The
     /// deadline guards against runaway expressions like <c>pow(pow(pow(...)))</c>
     /// that an authoring mistake could plant on the hot path.
+    /// <para>
+    /// 5 seconds is far longer than any sane expression should take (sub-ms
+    /// is the warm-state target) but provides headroom against thread-pool
+    /// scheduling delay under heavy parallel load.
+    /// </para>
     /// </summary>
-    public const int DefaultTimeoutMs = 1000;
+    public const int DefaultTimeoutMs = 5000;
 
     public static JsonElement? Evaluate(
         string expression,

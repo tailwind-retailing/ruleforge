@@ -758,6 +758,7 @@ static int SchemasVerb(string[] argv)
         ("distinct-config.schema.json",      typeof(RuleForge.Core.Models.DistinctConfig),      "Distinct (dedupe by key) node config"),
         ("switch-config.schema.json",        typeof(RuleForge.Core.Models.SwitchConfig),        "Switch (multi-way branch) node config"),
         ("group-by-config.schema.json",      typeof(RuleForge.Core.Models.GroupByConfig),       "GroupBy (partition array by key) node config"),
+        ("product-config.schema.json",       typeof(RuleForge.Core.Models.ProductConfig),       "Product (rule output shape) node config"),
         ("sub-rule-call.schema.json",        typeof(RuleForge.Core.Models.SubRuleCall),         "Sub-rule call (with optional forEach)"),
     };
 

@@ -110,13 +110,18 @@ static async Task<int> RunVerb(string[] argv)
         Console.WriteLine(JsonSerializer.Serialize(request, indented));
         Console.WriteLine();
 
+        // Shared HttpClient for any `api` nodes the rule may reach. Per-call
+        // deadlines are enforced by the runner via its mandatory `timeoutMs`,
+        // so the client is set to infinite — let the per-call CTS govern.
+        using var apiHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         var envelope = await new RuleRunner().RunAsync(
             rule,
             request,
             new RuleRunner.Options(
                 Debug: opts.Debug,
                 SubRuleSource: source,
-                ReferenceSetSource: refSource));
+                ReferenceSetSource: refSource,
+                HttpClient: apiHttp));
         Console.WriteLine("envelope :");
         Console.WriteLine(JsonSerializer.Serialize(envelope, indented));
         return envelope.Decision == Decision.Error ? 4 : 0;
@@ -541,6 +546,9 @@ static async Task<int> BenchVerb(string[] argv)
 
     var runner = new RuleRunner();
 
+    // Shared HttpClient for `api` nodes — see comment in `run` verb above.
+    using var apiHttp = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+
     Console.WriteLine($"â”â” bench â”â”");
     Console.WriteLine($"  rule         : {rule.Name} (v{rule.CurrentVersion})");
     Console.WriteLine($"  source       : {(opts.UseDf ? "DocumentForge" : "local file")}");
@@ -553,7 +561,11 @@ static async Task<int> BenchVerb(string[] argv)
 
     // Sanity run on the warm source so we know the rule is well-formed.
     var sample = await runner.RunAsync(rule, request,
-        new RuleRunner.Options(false, warmRuleSource, warmRefSource));
+        new RuleRunner.Options(
+            Debug: false,
+            SubRuleSource: warmRuleSource,
+            ReferenceSetSource: warmRefSource,
+            HttpClient: apiHttp));
     Console.WriteLine($"  sample run   : decision={sample.Decision}");
     Console.WriteLine();
 
@@ -571,7 +583,12 @@ static async Task<int> BenchVerb(string[] argv)
         {
             s = warmRuleSource; r = warmRefSource; ruleForCall = rule;
         }
-        await runner.RunAsync(ruleForCall, request, new RuleRunner.Options(false, s, r));
+        await runner.RunAsync(ruleForCall, request,
+            new RuleRunner.Options(
+                Debug: false,
+                SubRuleSource: s,
+                ReferenceSetSource: r,
+                HttpClient: apiHttp));
     }
 
     // Warmup

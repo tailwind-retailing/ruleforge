@@ -25,7 +25,9 @@ public sealed class RuleRunner
         IRuleSource? SubRuleSource = null,
         IReferenceSetSource? ReferenceSetSource = null,
         Func<DateTimeOffset>? Clock = null,
-        HttpClient? HttpClient = null);
+        HttpClient? HttpClient = null,
+        int MaxSubRuleDepth = 16,
+        IReadOnlyList<string>? SubRuleCallStack = null);
 
     public Envelope Run(Rule rule, JsonElement request, bool debug = false) =>
         RunAsync(rule, request, new Options(Debug: debug)).GetAwaiter().GetResult();
@@ -1379,15 +1381,32 @@ public sealed class RuleRunner
     {
         try
         {
+            // Inter-rule cycle detection + depth limit. The intra-rule HasCycle
+            // check at validate time only catches loops within a single rule's
+            // DAG; A → forEach → B → A across sub-rule boundaries was undetected
+            // and would stack-overflow the engine on the sub-millisecond hot path.
+            var currentStack = options.SubRuleCallStack ?? Array.Empty<string>();
+            if (currentStack.Count >= options.MaxSubRuleDepth)
+                throw new InvalidOperationException(
+                    $"sub-rule depth limit exceeded ({options.MaxSubRuleDepth}); " +
+                    $"chain: {string.Join(" → ", currentStack)} → {call.RuleId}");
+            if (currentStack.Contains(call.RuleId))
+                throw new InvalidOperationException(
+                    $"sub-rule cycle detected: rule '{call.RuleId}' is already in the call stack " +
+                    $"({string.Join(" → ", currentStack)})");
+
             var subRule = await options.SubRuleSource!.GetByIdAsync(call.RuleId, ResolveVersion(call.PinnedVersion), ct);
             if (subRule is null)
                 throw new InvalidOperationException($"subRuleCall: rule '{call.RuleId}' not found");
+
+            var nextStack = new List<string>(currentStack) { call.RuleId };
+            var nextOptions = options with { SubRuleCallStack = nextStack };
 
             // No forEach — single invocation path
             if (string.IsNullOrEmpty(call.ForEach))
             {
                 var subRequest = BuildSubRequest(call.InputMapping, parentRequest, parentCtx, frames, asName: null, item: null, index: 0, count: 1);
-                var subEnvelope = await RunInternalAsync(subRule, subRequest, options with { }, ct);
+                var subEnvelope = await RunInternalAsync(subRule, subRequest, nextOptions, ct);
                 var runId = $"srr-{call.RuleId}-{Guid.NewGuid():N}";
                 return subEnvelope.Decision switch
                 {
@@ -1409,7 +1428,7 @@ public sealed class RuleRunner
             for (var i = 0; i < items.Count; i++)
             {
                 var subReq = BuildSubRequest(call.InputMapping, parentRequest, parentCtx, frames, asName, items[i], i, items.Count);
-                var subEnv = await RunInternalAsync(subRule, subReq, options with { }, ct);
+                var subEnv = await RunInternalAsync(subRule, subReq, nextOptions, ct);
                 if (subEnv.Decision == Decision.Apply)
                 {
                     // Build per-iteration mapped object

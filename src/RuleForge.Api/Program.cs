@@ -8,6 +8,18 @@ using RuleForge.DocumentForge;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Defense-in-depth limits on the request hot path. The reverse proxy in
+// front (Render, Cloudflare, etc.) will typically enforce its own caps
+// too, but we don't trust those — the engine is single-tenant per airline
+// and a misconfigured client should not OOM the pod. 5 MB is generous for
+// realistic pax / segment payloads; raise via env if a real customer
+// needs more. JsonReaderOptions.MaxDepth is set per-parse below.
+const long MaxRequestBytes = 5_000_000;
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.Limits.MaxRequestBodySize = MaxRequestBytes;
+});
+
 var ruleSourceKind = (builder.Configuration["RULEFORGE_RULE_SOURCE"]
                       ?? Environment.GetEnvironmentVariable("RULEFORGE_RULE_SOURCE")
                       ?? "local").ToLowerInvariant();
@@ -169,19 +181,28 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
 
     // Body is optional — GETs typically have none, and POSTs may legitimately
     // ship empty bodies for parameterless rules. Default to {} when absent.
+    // Malformed JSON now returns 400 (was: silently substituted {}, which
+    // masked client bugs and let attackers probe parsing latency).
     JsonElement payload;
     if (http.Request.ContentLength is > 0
         || (http.Request.ContentLength is null && http.Request.Body.CanRead && http.Request.Method == "POST"))
     {
+        // MaxDepth=32 blocks billion-laughs / deep-nesting CPU attacks. Real
+        // airline payloads rarely nest beyond ~10; 32 is comfortable headroom.
+        var jsonOpts = new JsonDocumentOptions { MaxDepth = 32 };
         try
         {
-            using var doc = await JsonDocument.ParseAsync(http.Request.Body);
+            using var doc = await JsonDocument.ParseAsync(http.Request.Body, jsonOpts);
             payload = doc.RootElement.Clone();
         }
-        catch (JsonException)
+        catch (JsonException e)
         {
-            using var fallback = JsonDocument.Parse("{}");
-            payload = fallback.RootElement.Clone();
+            return Results.BadRequest(new { error = "invalid_json", detail = e.Message });
+        }
+        catch (Microsoft.AspNetCore.Http.BadHttpRequestException e)
+        {
+            // Kestrel raises this for body-size limit violations.
+            return Results.BadRequest(new { error = "request_too_large_or_malformed", detail = e.Message });
         }
     }
     else

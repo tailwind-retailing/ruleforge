@@ -1,4 +1,7 @@
-﻿namespace RuleForge.Api;
+﻿using System.Security.Cryptography;
+using System.Text;
+
+namespace RuleForge.Api;
 
 /// <summary>
 /// Minimal X-AERO-Key shared-secret check. Configure with the
@@ -37,8 +40,13 @@ public sealed class ApiKeyMiddleware
             return;
         }
 
-        if (TryReadKey(http.Request, out var supplied) &&
-            FixedTimeEquals(supplied, _expected))
+        // Always run the constant-time compare regardless of whether the
+        // header is present / right-length. TryReadKey returns "" on miss,
+        // and FixedTimeEquals pads to expected length internally — so an
+        // attacker can no longer probe by timing whether they have the
+        // right header name or the right key length.
+        TryReadKey(http.Request, out var supplied);
+        if (FixedTimeEquals(supplied, _expected))
         {
             await _next(http);
             return;
@@ -74,13 +82,24 @@ public sealed class ApiKeyMiddleware
         return false;
     }
 
-    /// <summary>Constant-time string comparison to deter timing attacks.</summary>
-    private static bool FixedTimeEquals(string a, string b)
+    /// <summary>
+    /// Constant-time comparison that does not leak length. Compares
+    /// <paramref name="supplied"/> against <paramref name="expected"/> as
+    /// UTF-8 bytes. On length mismatch, compares against a zero buffer of
+    /// the expected length so the comparison work is identical regardless
+    /// of how wrong the supplied value is.
+    /// </summary>
+    private static bool FixedTimeEquals(string supplied, string expected)
     {
-        if (a.Length != b.Length) return false;
-        var diff = 0;
-        for (var i = 0; i < a.Length; i++)
-            diff |= a[i] ^ b[i];
-        return diff == 0;
+        var expectedBytes = Encoding.UTF8.GetBytes(expected);
+        var suppliedBytes = Encoding.UTF8.GetBytes(supplied);
+
+        var lengthMatch = suppliedBytes.Length == expectedBytes.Length;
+        var compareBytes = lengthMatch ? suppliedBytes : new byte[expectedBytes.Length];
+        var contentMatch = CryptographicOperations.FixedTimeEquals(compareBytes, expectedBytes);
+
+        // & not &&: both must evaluate so a length mismatch can't short-circuit
+        // out of the constant-time content compare.
+        return lengthMatch & contentMatch;
     }
 }

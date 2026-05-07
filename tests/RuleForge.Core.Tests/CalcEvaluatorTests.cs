@@ -16,6 +16,37 @@ public class CalcEvaluatorTests
     }
 
     [Fact]
+    public void Default_timeout_does_not_break_normal_expressions()
+    {
+        // Sanity: ordinary expressions run well under the 1000ms default.
+        var result = CalcEvaluator.Evaluate("2 + 3 * 4", null, Ctx(), Json("{}"));
+        Assert.Equal(14, result!.Value.GetInt32());
+    }
+
+    [Fact]
+    public void Timeout_fires_on_runaway_expression()
+    {
+        // Generate a wide chain of additions — large enough that NCalc's
+        // recursive evaluator can't finish under a 1ms deadline on any
+        // realistic machine. If this becomes flaky on very fast machines,
+        // raise the term count rather than the timeout.
+        var terms = string.Concat(System.Linq.Enumerable.Repeat("1+", 200_000)) + "0";
+        var ex = Assert.Throws<InvalidOperationException>(() =>
+            CalcEvaluator.Evaluate(terms, null, Ctx(), Json("{}"), frames: null, timeoutMs: 1));
+        Assert.Contains("timed out", ex.Message);
+        Assert.Contains("1ms", ex.Message);
+    }
+
+    [Fact]
+    public void Zero_or_negative_timeout_is_rejected()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            CalcEvaluator.Evaluate("1+1", null, Ctx(), Json("{}"), frames: null, timeoutMs: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            CalcEvaluator.Evaluate("1+1", null, Ctx(), Json("{}"), frames: null, timeoutMs: -5));
+    }
+
+    [Fact]
     public void Arithmetic_against_upstream_field()
     {
         // upstream.fee * (1 + markup) where markup comes from request

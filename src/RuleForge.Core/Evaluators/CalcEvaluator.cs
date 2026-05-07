@@ -13,6 +13,14 @@ namespace RuleForge.Core.Evaluators;
 /// </summary>
 public static class CalcEvaluator
 {
+    /// <summary>
+    /// Default per-call deadline for calc expressions. NCalcSync has no native
+    /// cancellation, so we race <c>Evaluate()</c> against this on a Task. The
+    /// deadline guards against runaway expressions like <c>pow(pow(pow(...)))</c>
+    /// that an authoring mistake could plant on the hot path.
+    /// </summary>
+    public const int DefaultTimeoutMs = 1000;
+
     public static JsonElement? Evaluate(
         string expression,
         JsonElement? upstream,
@@ -25,8 +33,12 @@ public static class CalcEvaluator
         JsonElement? upstream,
         IDictionary<string, JsonElement> ctx,
         JsonElement request,
-        IReadOnlyList<IterationFrame>? frames)
+        IReadOnlyList<IterationFrame>? frames,
+        int timeoutMs = DefaultTimeoutMs)
     {
+        if (timeoutMs <= 0)
+            throw new ArgumentOutOfRangeException(nameof(timeoutMs), "timeoutMs must be > 0");
+
         // Default options: case-sensitive operators / functions. We do our own
         // case-insensitive variable resolution against the JSON inputs below.
         var expr = new Expression(expression);
@@ -37,11 +49,24 @@ public static class CalcEvaluator
                 args.Result = resolved;
         };
 
+        // Race expr.Evaluate() against the deadline. NCalcSync evaluation is
+        // CPU-bound and uncancellable; if the wait times out we fail fast. The
+        // background task may continue spinning until NCalc finishes — that's
+        // a known leak pending NCalc cancellation support, but the request
+        // returns promptly.
         object? result;
         try
         {
-            result = expr.Evaluate();
+            var task = Task.Run(() => expr.Evaluate());
+            if (!task.Wait(timeoutMs))
+            {
+                throw new InvalidOperationException(
+                    $"calc expression '{expression}' timed out after {timeoutMs}ms " +
+                    "(likely a runaway / deeply-nested expression)");
+            }
+            result = task.GetAwaiter().GetResult();
         }
+        catch (InvalidOperationException) { throw; }
         catch (Exception e)
         {
             throw new InvalidOperationException(

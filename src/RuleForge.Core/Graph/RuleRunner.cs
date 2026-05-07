@@ -27,7 +27,8 @@ public sealed class RuleRunner
         Func<DateTimeOffset>? Clock = null,
         HttpClient? HttpClient = null,
         int MaxSubRuleDepth = 16,
-        IReadOnlyList<string>? SubRuleCallStack = null);
+        IReadOnlyList<string>? SubRuleCallStack = null,
+        bool RedactTraceErrors = false);
 
     public Envelope Run(Rule rule, JsonElement request, bool debug = false) =>
         RunAsync(rule, request, new Options(Debug: debug)).GetAwaiter().GetResult();
@@ -119,9 +120,12 @@ public sealed class RuleRunner
                     case SubRuleStatus.Skipped:
                         break;
                     case SubRuleStatus.Failed:
+                        var subErrMsg = options.RedactTraceErrors
+                            ? ClassifyError(subResult.Error ?? "")
+                            : subResult.Error;
                         trace?.Add(new TraceEntry(
                             node.Id, IsoUtc(nodeStarted), sw.ElapsedMilliseconds, TraceOutcome.Error,
-                            Error: subResult.Error, SubRuleRunId: subRuleRunId, CtxRead: ctxBefore));
+                            Error: subErrMsg, SubRuleRunId: subRuleRunId, CtxRead: ctxBefore));
                         return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
                 }
             }
@@ -135,9 +139,10 @@ public sealed class RuleRunner
             }
             catch (Exception e)
             {
+                var errMsg = options.RedactTraceErrors ? ClassifyError(e) : e.Message;
                 trace?.Add(new TraceEntry(
                     node.Id, IsoUtc(nodeStarted), sw.ElapsedMilliseconds, TraceOutcome.Error,
-                    Error: e.Message, SubRuleRunId: subRuleRunId));
+                    Error: errMsg, SubRuleRunId: subRuleRunId));
                 return new Envelope(rule.Id, version, Decision.Error, IsoUtc(startedAtUtc), null, trace, totalSw?.ElapsedMilliseconds);
             }
             sw.Stop();
@@ -1770,6 +1775,42 @@ public sealed class RuleRunner
     }
 
     private static string IsoUtc(DateTimeOffset t) => t.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+
+    /// <summary>
+    /// Classifies a node-execution error message into a stable code suitable
+    /// for inclusion in the trace returned to callers when
+    /// <see cref="Options.RedactTraceErrors"/> is set. The full message and
+    /// stack trace are still available to server-side logs via the original
+    /// exception — only the trace returned over the wire is redacted.
+    /// </summary>
+    private static string ClassifyError(Exception e) => ClassifyError(e.Message ?? "", e);
+    private static string ClassifyError(string msg) => ClassifyError(msg, null);
+    private static string ClassifyError(string msg, Exception? e)
+    {
+        // Idempotency: if the input is already a redacted code (UPPER_SNAKE),
+        // don't re-classify it. This happens when a sub-rule's trace already
+        // ran ClassifyError and bubbled the code up via subResult.Error.
+        if (msg.Length > 0 && msg.All(c => char.IsUpper(c) || c == '_'))
+            return msg;
+
+        if (msg.Contains("cycle detected", StringComparison.OrdinalIgnoreCase))   return "SUBRULE_CYCLE";
+        if (msg.Contains("depth limit exceeded", StringComparison.OrdinalIgnoreCase)) return "SUBRULE_DEPTH_EXCEEDED";
+        if (msg.Contains("timed out", StringComparison.OrdinalIgnoreCase))        return "EVALUATION_TIMEOUT";
+        if (msg.StartsWith("api '", StringComparison.Ordinal))                    return "API_NODE_ERROR";
+        if (msg.StartsWith("calc expression", StringComparison.Ordinal))          return "CALC_EVAL_ERROR";
+        if (msg.StartsWith("filter node", StringComparison.Ordinal))              return "FILTER_CONFIG_ERROR";
+        if (msg.StartsWith("mutator", StringComparison.Ordinal))                  return "MUTATOR_ERROR";
+        if (msg.StartsWith("reference '", StringComparison.Ordinal))              return "REFERENCE_ERROR";
+        if (msg.StartsWith("bucket '", StringComparison.Ordinal))                 return "BUCKET_ERROR";
+        if (msg.StartsWith("assert '", StringComparison.Ordinal))                 return "ASSERT_FAILED";
+        if (msg.StartsWith("sort '", StringComparison.Ordinal))                   return "SORT_ERROR";
+        if (msg.StartsWith("limit '", StringComparison.Ordinal))                  return "LIMIT_ERROR";
+        if (msg.StartsWith("distinct '", StringComparison.Ordinal))               return "DISTINCT_ERROR";
+        if (msg.StartsWith("switch '", StringComparison.Ordinal))                 return "SWITCH_ERROR";
+        if (msg.StartsWith("groupBy '", StringComparison.Ordinal))                return "GROUP_BY_ERROR";
+        if (e is JsonException || msg.Contains("not valid JSON", StringComparison.OrdinalIgnoreCase)) return "INVALID_JSON";
+        return "NODE_EXECUTION_ERROR";
+    }
 
     private static TraceOutcome ToOutcome(Verdict v) => v switch
     {

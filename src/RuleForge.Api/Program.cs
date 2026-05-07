@@ -217,6 +217,14 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
 
     var refSource = http.RequestServices.GetService<IReferenceSetSource>();
     var apiHttp = http.RequestServices.GetService<HttpClient>();
+    // Redact trace error messages by default in the API host — the trace
+    // shape stays intact (codes + per-node outcomes), but raw exception
+    // messages stay in server-side logs only. Override with
+    // RULEFORGE_REDACT_TRACE_ERRORS=false during debugging.
+    var redactCfg = http.RequestServices.GetRequiredService<IConfiguration>()["RULEFORGE_REDACT_TRACE_ERRORS"]
+                    ?? Environment.GetEnvironmentVariable("RULEFORGE_REDACT_TRACE_ERRORS")
+                    ?? "true";
+    var redact = !string.Equals(redactCfg, "false", StringComparison.OrdinalIgnoreCase);
     var envelope = await runner.RunAsync(
         rule,
         payload,
@@ -224,7 +232,8 @@ static async Task<IResult> Dispatch(HttpContext http, IRuleSource source, RuleRu
             Debug: debug,
             SubRuleSource: source,
             ReferenceSetSource: refSource,
-            HttpClient: apiHttp),
+            HttpClient: apiHttp,
+            RedactTraceErrors: redact),
         http.RequestAborted);
     return Results.Json(envelope);
 }

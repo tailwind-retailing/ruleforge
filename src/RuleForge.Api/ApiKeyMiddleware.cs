@@ -20,6 +20,7 @@ public sealed class ApiKeyMiddleware
     private static readonly HashSet<string> BypassPaths = new(StringComparer.OrdinalIgnoreCase)
     {
         "/health",
+        "/ready",
     };
 
     private readonly RequestDelegate _next;

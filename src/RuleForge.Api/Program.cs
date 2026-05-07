@@ -79,6 +79,36 @@ app.UseMiddleware<ApiKeyMiddleware>();
 
 app.MapGet("/health", () => Results.Ok(new { ok = true }));
 
+// Readiness — probes the rule source so orchestrators (k8s, Render) can
+// distinguish "process alive but rule source down" from "process alive
+// and serving traffic". Bypasses auth like /health, so readiness probes
+// don't need to ship the API key. 2s budget keeps the probe cheap even
+// when DF is slow.
+app.MapGet("/ready", async (IRuleSource source, IReferenceSetSource? refSrc, CancellationToken ct) =>
+{
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    cts.CancelAfter(TimeSpan.FromSeconds(2));
+    try
+    {
+        var bindings = await source.ListBindingsAsync(cts.Token);
+        return Results.Ok(new
+        {
+            ok = true,
+            ruleSource = "ok",
+            bindingCount = bindings.Count,
+            referenceSource = refSrc is null ? "not_configured" : "ok",
+        });
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested && !ct.IsCancellationRequested)
+    {
+        return Results.Json(new { ok = false, ruleSource = "timeout" }, statusCode: 503);
+    }
+    catch (Exception e)
+    {
+        return Results.Json(new { ok = false, ruleSource = "error", detail = e.Message }, statusCode: 503);
+    }
+});
+
 // ─── admin ──────────────────────────────────────────────────────────────────
 //
 // Two ops surfaces, both gated by ApiKeyMiddleware:

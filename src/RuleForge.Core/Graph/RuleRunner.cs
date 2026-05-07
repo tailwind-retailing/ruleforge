@@ -1139,7 +1139,9 @@ public sealed class RuleRunner
                 throw new InvalidOperationException($"sort '{nodeId}': encountered null sort key");
             return nullHandling == "first" ? 1 : -1;
         }
-        return CompareJsonElements(a.Value, b.Value);
+        // The aNull/bNull guards above prove both have a value; flow analysis
+        // can't see it, hence the null-forgiving operators.
+        return CompareJsonElements(a!.Value, b!.Value);
     }
 
     private static int CompareJsonElements(JsonElement a, JsonElement b)

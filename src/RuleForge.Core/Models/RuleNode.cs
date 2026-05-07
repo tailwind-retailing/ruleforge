@@ -30,7 +30,6 @@ public enum NodeCategory
     [JsonStringEnumMemberName("logic")] Logic,
     [JsonStringEnumMemberName("filter")] Filter,
     [JsonStringEnumMemberName("product")] Product,
-    [JsonStringEnumMemberName("sql")] Sql,
     [JsonStringEnumMemberName("api")] Api,
     [JsonStringEnumMemberName("reference")] Reference,
     [JsonStringEnumMemberName("ruleRef")] RuleRef,

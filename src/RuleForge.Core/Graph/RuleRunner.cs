@@ -803,15 +803,22 @@ public sealed class RuleRunner
         if (string.IsNullOrEmpty(cfg.ReferenceId))
             throw new InvalidOperationException($"reference '{node.Id}' missing referenceId");
 
-        var refSet = await options.ReferenceSetSource.GetByIdAsync(cfg.ReferenceId, ct)
-                     ?? throw new InvalidOperationException($"reference '{node.Id}': set '{cfg.ReferenceId}' not found");
-
         var match = new Dictionary<string, JsonElement?>();
         if (cfg.MatchOn is not null)
         {
             foreach (var kv in cfg.MatchOn)
                 match[kv.Key] = ResolveFromPath(kv.Value, run.Request, run.Ctx, frames);
         }
+
+        // Memoize on (refId, resolved match). Reference sets are pure within
+        // a request, so iteration patterns that repeat the same lookup
+        // (per-pax tax rate, per-segment fare class) skip the row scan.
+        var cacheKey = ComputeRefLookupKey(cfg.ReferenceId, match);
+        if (run.ReferenceLookupCache.TryGetValue(cacheKey, out var cached))
+            return (Verdict.Pass, cached);
+
+        var refSet = await options.ReferenceSetSource.GetByIdAsync(cfg.ReferenceId, ct)
+                     ?? throw new InvalidOperationException($"reference '{node.Id}': set '{cfg.ReferenceId}' not found");
 
         var rows = new JsonArray();
         foreach (var row in refSet.Rows)
@@ -828,7 +835,24 @@ public sealed class RuleRunner
             rows.Add(rowObj);
         }
 
-        return (Verdict.Pass, JsonDocument.Parse(rows.ToJsonString()).RootElement);
+        var result = JsonDocument.Parse(rows.ToJsonString()).RootElement;
+        run.ReferenceLookupCache[cacheKey] = result;
+        return (Verdict.Pass, result);
+    }
+
+    private static string ComputeRefLookupKey(string refId, IReadOnlyDictionary<string, JsonElement?> match)
+    {
+        var sb = new StringBuilder();
+        sb.Append(refId).Append('|');
+        // Stable order so different orderings of the same match dict hit the same key.
+        foreach (var k in match.Keys.OrderBy(x => x, StringComparer.Ordinal))
+        {
+            sb.Append(k).Append('=');
+            var v = match[k];
+            sb.Append(v.HasValue ? v.Value.GetRawText() : "<null>");
+            sb.Append(';');
+        }
+        return sb.ToString();
     }
 
     // ─── api (outbound HTTP) ───────────────────────────────────────────────
@@ -1624,6 +1648,14 @@ public sealed class RuleRunner
         public Dictionary<string, JsonElement> NodeOutputs { get; } = new();
         public Dictionary<string, Verdict> Verdicts { get; } = new();
         public Dictionary<string, int> IteratorCounts { get; } = new();
+
+        // Per-request memoization for reference lookups. Reference sets are
+        // pure functions of (refId, matchOn); within a single request the same
+        // query gives the same answer. Cache scope is the RunState so it never
+        // leaks across requests, and within one request it skips redundant
+        // O(rows) scans on iteration-heavy patterns where the same lookup
+        // fires per-passenger / per-segment.
+        public Dictionary<string, JsonElement> ReferenceLookupCache { get; } = new();
 
         public RunState(GraphInfo graph, JsonElement request, Options options, List<TraceEntry>? trace)
         {
